@@ -27,11 +27,12 @@ const SPIN: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'
 /// berjalan tidak ikut menyetujui.
 const ASK_GUARD: Duration = Duration::from_millis(500);
 
-const COMMANDS: [(&str, &str); 6] = [
+const COMMANDS: [(&str, &str); 7] = [
     ("/help", "bantuan"),
     ("/model", "lihat atau ganti model"),
     ("/think", "aktif/nonaktifkan thinking"),
-    ("/clear", "kosongkan percakapan"),
+    ("/compact", "ringkas percakapan untuk menghemat context"),
+    ("/clear", "mulai percakapan baru"),
     ("/copy", "salin jawaban terakhir (OSC 52)"),
     ("/exit", "keluar"),
 ];
@@ -557,6 +558,9 @@ impl Ui {
             Ev::TermClosed => self.quit = true,
             Ev::Text(s) => self.text(&s),
             Ev::Think(n) => self.thought = n,
+            Ev::User(s) => self.lines(DIM, "› ", &s),
+            Ev::EndText => self.end_text(),
+            Ev::Work(s) => self.tool = Some(s.into()),
             Ev::Tool { title, detail } => {
                 self.end_text();
                 let title = sanitize(&title);
@@ -589,6 +593,7 @@ impl Ui {
             Ev::Status { tokens, ctx, model, think } => self.status = (tokens, ctx, model, think),
             Ev::Info(s) => {
                 self.end_text();
+                self.tool = None;
                 self.lines(DIM, "  ", &s);
             }
             Ev::Error(s) => {
@@ -633,6 +638,7 @@ impl Ui {
         match name {
             "/exit" | "/quit" => self.quit = true,
             "/clear" => self.start(Cmd::Clear),
+            "/compact" => self.start(Cmd::Compact),
             "/think" => self.start(Cmd::Think),
             "/model" => {
                 let a = arg.trim();
@@ -647,7 +653,7 @@ impl Ui {
             "/help" => {
                 let mut h = String::new();
                 for (k, d) in COMMANDS {
-                    h += &format!("{k:<8} {d}\n");
+                    h += &format!("{k:<9} {d}\n");
                 }
                 h += "\n@        sebut file\nEnter    kirim (saat bekerja: antre)\nAlt+Enter, Ctrl+J, atau \\ lalu Enter: baris baru\nEsc      hentikan giliran\nCtrl-C   hentikan; dua kali untuk keluar";
                 self.lines(DIM, "  ", &h);

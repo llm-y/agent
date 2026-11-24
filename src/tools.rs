@@ -13,6 +13,11 @@ use std::time::{Duration, Instant};
 
 const READ_MAX: usize = 16_000;
 const BASH_MAX: usize = 8_000;
+
+/// Batas byte satu hasil tool: paling banyak sekitar seperempat context.
+fn cap(max: usize, ctx: u64) -> usize {
+    max.min(ctx as usize * 3 / 4).max(2_000)
+}
 const FILE_MAX: u64 = 10 << 20;
 
 pub fn schema() -> Value {
@@ -258,15 +263,15 @@ impl Output {
     }
 }
 
-pub fn run(p: Prepared, cwd: &Path, cancel: &Cancel) -> Output {
+pub fn run(p: Prepared, cwd: &Path, ctx: u64, cancel: &Cancel) -> Output {
     match p.action {
-        Action::Read { path, offset, limit } => read(&path, offset, limit).unwrap_or_else(Output::err),
+        Action::Read { path, offset, limit } => read(&path, offset, limit, cap(READ_MAX, ctx)).unwrap_or_else(Output::err),
         Action::Write { path, old, new, is_edit } => write(&path, old, &new, is_edit).unwrap_or_else(Output::err),
-        Action::Bash { cmd, timeout } => bash(&cmd, timeout, cwd, cancel).unwrap_or_else(Output::err),
+        Action::Bash { cmd, timeout } => bash(&cmd, timeout, cwd, cap(BASH_MAX, ctx), cancel).unwrap_or_else(Output::err),
     }
 }
 
-fn read(path: &Path, offset: usize, limit: usize) -> Result<Output, String> {
+fn read(path: &Path, offset: usize, limit: usize, max: usize) -> Result<Output, String> {
     if path.is_dir() {
         let mut v: Vec<String> = fs::read_dir(path).map_err(|e| e.to_string())?.flatten()
             .map(|e| {
@@ -293,7 +298,7 @@ fn read(path: &Path, offset: usize, limit: usize) -> Result<Output, String> {
     let (mut text, mut n) = (String::new(), 0);
     for (i, l) in src.lines().enumerate().skip(offset - 1).take(limit) {
         let l = clip(l, 2000);
-        if n > 0 && text.len() + l.len() > READ_MAX {
+        if n > 0 && text.len() + l.len() > max {
             break;
         }
         text += &format!("{}\t{}\n", i + 1, l);
@@ -335,29 +340,33 @@ fn write(path: &Path, old: Option<String>, new: &str, is_edit: bool) -> Result<O
 }
 
 /// Penampung output berbatas: simpan awal dan akhir, buang tengah.
-#[derive(Default)]
 struct Capped {
     head: Vec<u8>,
     tail: Vec<u8>,
     dropped: usize,
+    max: usize,
 }
 
 impl Capped {
+    fn new(max: usize) -> Self {
+        Capped { head: vec![], tail: vec![], dropped: 0, max }
+    }
+
     fn push(&mut self, mut b: &[u8]) {
-        let room = (BASH_MAX / 2).saturating_sub(self.head.len()).min(b.len());
+        let room = (self.max / 2).saturating_sub(self.head.len()).min(b.len());
         self.head.extend_from_slice(&b[..room]);
         b = &b[room..];
         self.tail.extend_from_slice(b);
-        if self.tail.len() > BASH_MAX {
-            let cut = self.tail.len() - BASH_MAX / 2;
+        if self.tail.len() > self.max {
+            let cut = self.tail.len() - self.max / 2;
             self.tail.drain(..cut);
             self.dropped += cut;
         }
     }
 
     fn text(&mut self) -> String {
-        if self.tail.len() > BASH_MAX / 2 {
-            let cut = self.tail.len() - BASH_MAX / 2;
+        if self.tail.len() > self.max / 2 {
+            let cut = self.tail.len() - self.max / 2;
             self.tail.drain(..cut);
             self.dropped += cut;
         }
@@ -371,7 +380,7 @@ impl Capped {
     }
 }
 
-fn bash(cmd: &str, timeout: u64, cwd: &Path, cancel: &Cancel) -> Result<Output, String> {
+fn bash(cmd: &str, timeout: u64, cwd: &Path, max: usize, cancel: &Cancel) -> Result<Output, String> {
     let io = |e: std::io::Error| format!("bash: {e}");
     let (mut rd, wr) = std::io::pipe().map_err(io)?;
     let mut c = Command::new("bash");
@@ -384,7 +393,7 @@ fn bash(cmd: &str, timeout: u64, cwd: &Path, cancel: &Cancel) -> Result<Output, 
     let pgid = child.id() as i32;
     cancel.set_pgid(pgid);
 
-    let buf = Arc::new(Mutex::new(Capped::default()));
+    let buf = Arc::new(Mutex::new(Capped::new(max)));
     let (tx, eof) = std::sync::mpsc::channel::<()>();
     let b2 = buf.clone();
     std::thread::spawn(move || {
@@ -480,7 +489,7 @@ mod tests {
         fs::write(d.join("f"), "satu").unwrap();
         let p = prepare("edit", &json!({"path":"f","old":"satu","new":"dua"}), &d).unwrap();
         fs::write(d.join("f"), "lain").unwrap();
-        assert!(!run(p, &d, &Cancel::default()).ok);
+        assert!(!run(p, &d, 32768, &Cancel::default()).ok);
         assert_eq!(fs::read_to_string(d.join("f")).unwrap(), "lain");
     }
 
@@ -497,11 +506,11 @@ mod tests {
     fn bash_exit_timeout_latar_batal() {
         let d = dir("bash");
         let c = Cancel::default();
-        let o = bash("echo hai; echo err >&2; exit 3", 5, &d, &c).unwrap();
+        let o = bash("echo hai; echo err >&2; exit 3", 5, &d, BASH_MAX, &c).unwrap();
         assert!(o.text.contains("hai") && o.text.contains("err") && o.text.contains("[exit 3]"));
         let t = Instant::now();
-        assert!(bash("sleep 20 & sleep 20", 1, &d, &c).unwrap().summary.contains("batas"));
-        assert!(bash("sleep 3 & echo ok", 5, &d, &c).unwrap().text.contains("ok"));
+        assert!(bash("sleep 20 & sleep 20", 1, &d, BASH_MAX, &c).unwrap().summary.contains("batas"));
+        assert!(bash("sleep 3 & echo ok", 5, &d, BASH_MAX, &c).unwrap().text.contains("ok"));
         assert!(t.elapsed() < Duration::from_secs(3));
         let c = Arc::new(Cancel::default());
         let c2 = c.clone();
@@ -510,14 +519,24 @@ mod tests {
             c2.cancel();
         });
         let t = Instant::now();
-        assert_eq!(bash("sleep 20", 30, &d, &c).unwrap().summary, "dibatalkan");
+        assert_eq!(bash("sleep 20", 30, &d, BASH_MAX, &c).unwrap().summary, "dibatalkan");
         assert!(t.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn hasil_mengikuti_context() {
+        let d = dir("ctx");
+        fs::write(d.join("f"), "0123456789\n".repeat(3000)).unwrap();
+        let r = |ctx| run(prepare("read", &json!({"path":"f","limit":2000}), &d).unwrap(), &d, ctx, &Cancel::default()).text.len();
+        assert!(r(8192) < 6_500 && r(4096) < 3_500 && r(131072) > 12_000);
+        let o = run(prepare("bash", &json!({"command":"seq 1 9999"}), &d).unwrap(), &d, 4096, &Cancel::default());
+        assert!(o.text.len() < 3_300);
     }
 
     #[test]
     fn output_besar_dipotong() {
         let d = dir("besar");
-        let o = bash("seq 1 200000", 20, &d, &Cancel::default()).unwrap();
+        let o = bash("seq 1 200000", 20, &d, BASH_MAX, &Cancel::default()).unwrap();
         assert!(o.text.len() < BASH_MAX + 200 && o.text.contains("dipotong"));
         assert!(o.text.starts_with("1\n") && o.text.contains("200000"));
     }

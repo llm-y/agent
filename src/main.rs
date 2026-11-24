@@ -4,6 +4,8 @@ mod editor;
 mod http;
 mod perm;
 mod provider;
+mod rules;
+mod session;
 mod tools;
 mod ui;
 
@@ -11,6 +13,7 @@ use agent::{Agent, Cmd, Ev};
 use cancel::Cancel;
 use perm::Perm;
 use provider::Provider;
+use session::Session;
 use std::io::{IsTerminal, Read, Write};
 use std::sync::Arc;
 use std::sync::mpsc::channel;
@@ -26,16 +29,26 @@ Opsi:
       --url <url>      alamat Ollama     (env LLMY_URL, bawaan http://localhost:11434)
       --ctx <n>        ukuran context    (env LLMY_CTX, bawaan 32768)
       --think          aktifkan thinking
+  -c, --continue       lanjutkan sesi terakhir di folder ini
+  -r, --resume <id>    lanjutkan sesi tertentu
+      --sessions       daftar sesi di folder ini
+      --no-session     jangan simpan sesi
       --allow <daftar> tanpa tanya: edit, bash, atau edit,bash
   -p, --print <prompt> sekali jalan
   -h, --help / -V, --version
 
+Instruksi dibaca dari AGENTS.md (atau CLAUDE.md), akar git sampai folder kerja.
+Sesi disimpan di ~/.local/state/llmy/sessions, hanya bisa dibaca pemiliknya.
 edit berlaku hanya di dalam folder kerja. bash berjalan dengan hak akses Anda.";
 
 struct Opts {
     provider: Provider,
     perm: Perm,
     prompt: Option<String>,
+    /// Some(None) = sesi terakhir.
+    resume: Option<Option<String>>,
+    save: bool,
+    list: bool,
 }
 
 fn parse() -> Result<Opts, String> {
@@ -49,6 +62,9 @@ fn parse() -> Result<Opts, String> {
         },
         perm: Perm::default(),
         prompt: None,
+        resume: None,
+        save: true,
+        list: false,
     };
     let mut ctx = env("LLMY_CTX", "32768");
     let mut it = std::env::args().skip(1);
@@ -66,6 +82,10 @@ fn parse() -> Result<Opts, String> {
             "-m" | "--model" => o.provider.model = val()?,
             "--url" => o.provider.base = val()?,
             "--ctx" => ctx = val()?,
+            "-c" | "--continue" => o.resume = Some(None),
+            "-r" | "--resume" => o.resume = Some(Some(val()?)),
+            "--sessions" => o.list = true,
+            "--no-session" => o.save = false,
             "--think" => o.provider.think = true,
             "-p" | "--print" => o.prompt = Some(val()?),
             "--allow" => {
@@ -87,14 +107,24 @@ fn parse() -> Result<Opts, String> {
 fn main() {
     let o = parse().unwrap_or_else(|e| die(&e));
     let cwd = std::env::current_dir().and_then(std::fs::canonicalize).unwrap_or_else(|e| die(&e.to_string()));
+    let mut session = if o.save { session::root().map(|r| Session::new(&r, &cwd)) } else { None };
+    if o.list {
+        return list(session.as_ref());
+    }
     let cancel = Arc::new(Cancel::default());
     let (tx, rx) = channel();
     let interactive = o.prompt.is_none();
     if interactive && !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
         die("mode interaktif butuh terminal; pakai -p <prompt>");
     }
+    let history = match (&o.resume, &mut session) {
+        (None, _) => vec![],
+        (Some(id), Some(s)) => s.resume(id.as_deref()).unwrap_or_else(|e| die(&e)),
+        (Some(_), None) => die("--continue/--resume tidak bisa dipakai tanpa penyimpanan sesi"),
+    };
     on_signal(cancel.clone(), interactive);
-    let agent = Agent::new(o.provider, o.perm, interactive, cwd.clone(), cancel.clone(), tx.clone());
+    let agent = Agent::new(o.provider, o.perm, interactive, cwd.clone(), cancel.clone(), tx.clone())
+        .with_session(session, history);
     let (ctx, crx) = channel();
     std::thread::spawn(move || agent.serve(crx));
     match o.prompt {
@@ -112,8 +142,25 @@ fn main() {
                 }
             }
             let _ = ctx.send(Cmd::User(p));
-            std::process::exit(print_mode(rx));
+            std::process::exit(print_mode(rx, o.resume.is_some()));
         }
+    }
+}
+
+fn list(session: Option<&Session>) {
+    let v = session.map(|s| s.list()).unwrap_or_default();
+    if v.is_empty() {
+        println!("Belum ada sesi di folder ini.");
+    }
+    for e in v {
+        let m = e.modified.elapsed().map_or(0, |d| d.as_secs() / 60);
+        let age = match m {
+            0 => "baru saja".into(),
+            1..60 => format!("{m} menit lalu"),
+            60..1440 => format!("{} jam lalu", m / 60),
+            _ => format!("{} hari lalu", m / 1440),
+        };
+        println!("{:<22} {age:<15} {}", e.id, ui::sanitize(&e.title));
     }
 }
 
@@ -143,9 +190,10 @@ fn on_signal(cancel: Arc<Cancel>, interactive: bool) {
 }
 
 /// Jawaban ke stdout, jejak tool ke stderr.
-fn print_mode(rx: std::sync::mpsc::Receiver<Ev>) -> i32 {
+fn print_mode(rx: std::sync::mpsc::Receiver<Ev>, replay: bool) -> i32 {
     let mut code = 0;
     let mut nl = true;
+    let mut old = replay;
     let out = |s: &str| {
         let mut o = std::io::stdout();
         if o.write_all(s.as_bytes()).and_then(|_| o.flush()).is_err() {
@@ -154,6 +202,9 @@ fn print_mode(rx: std::sync::mpsc::Receiver<Ev>) -> i32 {
     };
     for e in rx {
         match e {
+            // Status pertama menandai akhir putar ulang riwayat.
+            Ev::Status { .. } => old = false,
+            Ev::Text(_) if old => {}
             Ev::Text(s) => {
                 nl = s.ends_with('\n');
                 out(&ui::sanitize(&s));

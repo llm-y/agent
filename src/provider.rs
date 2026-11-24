@@ -34,7 +34,8 @@ impl Provider {
         cancel: &Cancel,
         on: &mut dyn FnMut(Delta),
     ) -> Result<Reply, String> {
-        match self.chat_once(msgs, tools, Some(self.think), cancel, on) {
+        let think = self.think && tools.is_array();
+        match self.chat_once(msgs, tools, Some(think), cancel, on) {
             // Model tanpa thinking menolak field `think`; penolakan datang sebelum token apa pun.
             Err(e) if e.contains("does not support thinking") => {
                 self.chat_once(msgs, tools, None, cancel, on)
@@ -52,9 +53,15 @@ impl Provider {
         on: &mut dyn FnMut(Delta),
     ) -> Result<Reply, String> {
         let mut body = json!({
-            "model": self.model, "messages": msgs, "tools": tools, "stream": true,
+            "model": self.model, "messages": msgs, "stream": true,
             "options": {"num_ctx": self.ctx},
         });
+        if tools.is_array() {
+            body["tools"] = tools.clone();
+        } else {
+            // Tanpa tool = meringkas: batasi panjangnya.
+            body["options"]["num_predict"] = json!(1200);
+        }
         if let Some(t) = think {
             body["think"] = json!(t);
         }
