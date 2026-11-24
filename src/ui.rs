@@ -27,11 +27,13 @@ const SPIN: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'
 /// berjalan tidak ikut menyetujui.
 const ASK_GUARD: Duration = Duration::from_millis(500);
 
-const COMMANDS: [(&str, &str); 7] = [
+const COMMANDS: [(&str, &str); 9] = [
     ("/help", "bantuan"),
     ("/model", "lihat atau ganti model"),
     ("/think", "aktif/nonaktifkan thinking"),
     ("/compact", "ringkas percakapan untuk menghemat context"),
+    ("/remember", "simpan fakta: /remember <fakta> atau /remember all <fakta>"),
+    ("/memory", "lihat memori proyek dan semua proyek"),
     ("/clear", "mulai percakapan baru"),
     ("/copy", "salin jawaban terakhir (OSC 52)"),
     ("/exit", "keluar"),
@@ -417,8 +419,8 @@ impl Ui {
             if self.popup.is_empty() {
                 v.push(self.footer(w));
             } else {
-                let from = self.popup_sel.saturating_sub(4);
-                for (i, (k, d)) in self.popup.iter().enumerate().skip(from).take(6) {
+                let from = self.popup_sel.saturating_sub(7);
+                for (i, (k, d)) in self.popup.iter().enumerate().skip(from).take(COMMANDS.len()) {
                     let on = i == self.popup_sel;
                     let m = if on { "›" } else { " " };
                     v.push(Row::new(if on { CYAN } else { DIM }, &format!(" {m} {k}  {d}"), w));
@@ -642,6 +644,9 @@ impl Ui {
             "/clear" => self.start(Cmd::Clear),
             "/compact" => self.start(Cmd::Compact),
             "/think" => self.start(Cmd::Think),
+            "/remember" if arg.trim().is_empty() => self.lines(DIM, "  ", "Pakai: /remember <fakta> (proyek ini) atau /remember all <fakta> (semua proyek)"),
+            "/remember" => self.start(Cmd::Remember(arg.trim().into())),
+            "/memory" => self.start(Cmd::Memory),
             "/model" => {
                 let a = arg.trim();
                 self.start(Cmd::Model((!a.is_empty()).then(|| a.to_string())));
@@ -655,7 +660,7 @@ impl Ui {
             "/help" => {
                 let mut h = String::new();
                 for (k, d) in COMMANDS {
-                    h += &format!("{k:<9} {d}\n");
+                    h += &format!("{k:<10} {d}\n");
                 }
                 h += "\n@        sebut file\nEnter    kirim (saat bekerja: antre)\nAlt+Enter, Ctrl+J, atau \\ lalu Enter: baris baru\nEsc      hentikan giliran\nCtrl-C   hentikan; dua kali untuk keluar";
                 self.lines(DIM, "  ", &h);

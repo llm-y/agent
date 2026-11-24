@@ -4,6 +4,7 @@ mod cancel;
 mod editor;
 mod grep;
 mod http;
+mod memory;
 mod ollama;
 mod openai;
 mod perm;
@@ -52,11 +53,12 @@ Opsi:
   -r, --resume <id>    lanjutkan sesi tertentu
       --sessions       daftar sesi di folder ini
       --no-session     jangan simpan sesi
-      --allow <daftar> tanpa tanya: edit, bash, atau edit,bash
+      --allow <daftar> tanpa tanya: edit, bash, memory (pisahkan dengan koma)
   -p, --print <prompt> sekali jalan
   -h, --help / -V, --version
 
 Instruksi dibaca dari AGENTS.md (atau CLAUDE.md), akar git sampai folder kerja.
+Memori: bagian Memory di AGENTS.md proyek, atau ~/.config/llmy/AGENTS.md untuk semua proyek.
 Sesi disimpan di ~/.local/state/llmy/sessions (Windows: %LOCALAPPDATA%\\llmy), hanya bisa dibaca pemiliknya.
 edit berlaku hanya di dalam folder kerja. bash berjalan dengan hak akses Anda.";
 
@@ -109,6 +111,7 @@ fn parse() -> Result<(Opts, impl FnOnce() -> Result<Provider, String>), String> 
                     match s {
                         "edit" => o.perm.allow_edit = true,
                         "bash" => o.perm.allow_bash = true,
+                        "memory" => o.perm.allow_memory = true,
                         _ => return Err(format!("--allow tidak mengenal `{s}`")),
                     }
                 }
@@ -228,7 +231,13 @@ fn print_mode(rx: std::sync::mpsc::Receiver<Ev>, replay: bool) -> i32 {
                 }
             }
             Ev::ToolDone { summary, .. } => eprintln!("  └ {}", ui::sanitize(&summary)),
-            Ev::Info(s) => eprintln!("{}", ui::sanitize(&s)),
+            Ev::Info(s) => {
+                if !nl {
+                    out("\n");
+                    nl = true;
+                }
+                eprintln!("{}", ui::sanitize(&s));
+            }
             Ev::Error(s) => {
                 eprintln!("Error: {}", ui::sanitize(&s));
                 code = 1;

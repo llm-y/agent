@@ -1,7 +1,7 @@
 //! Instruksi proyek: AGENTS.md (atau CLAUDE.md) dari akar git sampai folder kerja,
 //! plus ~/.config/llmy/AGENTS.md. Dibatasi agar context model kecil tidak habis.
 
-use crate::sys;
+use crate::{memory, sys};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -13,8 +13,13 @@ pub struct Rules {
     pub truncated: bool,
 }
 
-fn global() -> Option<PathBuf> {
+pub fn global() -> Option<PathBuf> {
     sys::config_dir().map(|p| p.join("AGENTS.md"))
+}
+
+/// Akar proyek: folder git terdekat, atau folder kerja.
+pub fn top(cwd: &Path) -> &Path {
+    cwd.ancestors().find(|d| d.join(".git").exists()).unwrap_or(cwd)
 }
 
 pub fn load(cwd: &Path) -> Rules {
@@ -22,7 +27,7 @@ pub fn load(cwd: &Path) -> Rules {
 }
 
 fn load_from(cwd: &Path, global: Option<PathBuf>) -> Rules {
-    let top = cwd.ancestors().find(|d| d.join(".git").exists()).unwrap_or(cwd);
+    let top = top(cwd);
     let mut dirs: Vec<&Path> = cwd.ancestors().take_while(|d| d.starts_with(top)).collect();
     dirs.reverse();
     let mut found: Vec<(PathBuf, String)> = vec![];
@@ -50,7 +55,7 @@ fn load_from(cwd: &Path, global: Option<PathBuf>) -> Rules {
     let mut left = MAX;
     let mut parts = vec![];
     for (p, s) in found.iter().rev() {
-        let s = s.trim();
+        let s = memory::front(s.trim());
         if s.is_empty() {
             continue;
         }
