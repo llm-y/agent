@@ -12,6 +12,9 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// Pemisah nomor baris pada hasil `read`. Bukan tab atau `:`, agar nomor yang ikut disalin
+/// model bisa dibedakan dari isi file.
+const SEP: char = '│';
 const READ_MAX: usize = 16_000;
 const BASH_MAX: usize = 8_000;
 const GREP_MAX: usize = 8_000;
@@ -207,7 +210,7 @@ pub fn prepare(name: &str, a: &Value, cwd: &Path) -> Result<Prepared, String> {
         }
         "write" => {
             let path = resolve(cwd, &str_arg(a, "path")?)?;
-            let new = str_arg(a, "content")?;
+            let new = strip_copied(&str_arg(a, "content")?);
             let old = if path.exists() { Some(load(&path)?) } else { None };
             if old.as_deref() == Some(new.as_str()) {
                 return Err("isi file sudah sama; tidak ada yang berubah".into());
@@ -266,20 +269,97 @@ pub fn prepare(name: &str, a: &Value, cwd: &Path) -> Result<Prepared, String> {
     }
 }
 
+/// `12│isi` -> (12, isi).
+fn numbered(l: &str, sep: char) -> Option<(usize, &str)> {
+    let (n, rest) = l.split_once(sep)?;
+    let n = n.trim_start_matches(' ');
+    n.bytes().all(|b| b.is_ascii_digit()).then(|| n.parse().ok())?.map(|n| (n, rest))
+}
+
+/// Membuang nomor baris bila semua baris bernomor urut; hasilnya dengan nomor pertama.
+fn strip_numbers(s: &str, sep: char) -> Option<(usize, String)> {
+    let (mut first, mut out) = (None, vec![]);
+    for (i, l) in s.strip_suffix('\n').unwrap_or(s).split('\n').enumerate() {
+        let (n, rest) = numbered(l, sep)?;
+        if n.checked_sub(i)? != *first.get_or_insert(n) {
+            return None;
+        }
+        out.push(rest);
+    }
+    let end = if s.ends_with('\n') { "\n" } else { "" };
+    Some((first?, out.join("\n") + end))
+}
+
+/// Teks yang seluruhnya disalin dari hasil `read`.
+fn strip_copied(s: &str) -> String {
+    strip_numbers(s, SEP).map_or_else(|| s.to_string(), |r| r.1)
+}
+
+/// Model kecil menyalin nomor baris dari hasil `read` ke `old` dan `new`. Tab dan `|` (kebiasaan
+/// model, dan sesi lama) hanya diterima bila baris bernomor itu memang berisi `old`.
+/// Hasil: nomor baris `old` (bila bernomor), `old`, `new`.
+fn unnumber(src: &str, old: &str, new: &str) -> Result<(Option<usize>, String, String), String> {
+    let lf = src.replace("\r\n", "\n");
+    let found = |o: &str| lf.contains(o.trim_end_matches('\n'));
+    if found(old) {
+        let own = old.lines().any(|l| numbered(l, SEP).is_some());
+        return Ok((None, old.into(), if own { new.into() } else { strip_copied(new) }));
+    }
+    for sep in [SEP, '\t', '|'] {
+        let Some((at, o)) = strip_numbers(old, sep) else { continue };
+        let there = line_start(&lf, at).is_some_and(|i| lf[i..].starts_with(o.trim_end_matches('\n')));
+        if o.trim().is_empty() || !there && (sep != SEP || !found(&o)) {
+            continue;
+        }
+        let num = |l: &str| numbered(l, sep).is_some();
+        let filled = new.lines().filter(|l| !l.trim().is_empty()).count();
+        let count = new.lines().filter(|l| num(l)).count();
+        // Tidak bisa ditebak: isi filenya sendiri tampak bernomor (misalnya TSV), atau pemisahnya
+        // lazim di file dan hanya sebagian baris bernomor.
+        let own = o.lines().any(num);
+        let twice = new.lines().filter(|l| numbered(l, sep).is_some_and(|x| num(x.1))).count();
+        if own && twice != filled || sep != SEP && count != 0 && count != filled {
+            return Err("nomor baris dari read bukan isi file. Tulis `old` dan `new` tanpa nomor baris.".into());
+        }
+        let new: Vec<&str> = new.split('\n').map(|l| numbered(l, sep).map_or(l, |x| x.1)).collect();
+        return Ok((Some(at), o, new.join("\n")));
+    }
+    Ok((None, old.into(), new.into()))
+}
+
+/// Posisi byte awal baris ke-n (mulai 1).
+fn line_start(s: &str, n: usize) -> Option<usize> {
+    match n {
+        0 => None,
+        1 => Some(0),
+        _ => s.match_indices('\n').nth(n - 2).map(|x| x.0 + 1),
+    }
+}
+
 /// `hint`: boleh menyertakan potongan isi file pada pesan error.
 pub fn apply_edit(src: &str, old: &str, new: &str, all: bool, hint: bool) -> Result<String, String> {
     if old.is_empty() {
         return Err("`old` kosong. Untuk membuat file baru pakai write".into());
     }
-    let (mut old, mut new) = (old.to_string(), new.to_string());
+    let (at, mut old, mut new) = unnumber(src, old, new)?;
     if !src.contains(&old) && src.contains("\r\n") && !old.contains('\r') {
         old = old.replace('\n', "\r\n");
         new = new.replace('\n', "\r\n");
+    }
+    // Hasil `read` tidak menunjukkan bahwa baris terakhir tidak diakhiri ganti baris.
+    let bare = old.strip_suffix('\n').map(|o| o.strip_suffix('\r').unwrap_or(o)).unwrap_or("").to_string();
+    if !bare.is_empty() && !src.contains(&old) && src.ends_with(&bare) {
+        new = new.strip_suffix('\n').map_or(new.as_str(), |n| n.strip_suffix('\r').unwrap_or(n)).to_string();
+        old = bare;
     }
     if old == new {
         return Err("`old` dan `new` sama".into());
     }
     let hits: Vec<usize> = src.match_indices(&old).map(|(i, _)| i).collect();
+    // Nomor baris yang disalin model sekaligus menunjukkan tempatnya.
+    if !all && hits.len() > 1 && let Some(i) = at.and_then(|n| line_start(src, n)).filter(|i| hits.contains(i)) {
+        return Ok(format!("{}{new}{}", &src[..i], &src[i + old.len()..]));
+    }
     match hits.len() {
         0 => {
             let mut e = String::from("`old` tidak ditemukan di file.");
@@ -381,7 +461,7 @@ fn read(path: &Path, offset: usize, limit: usize, max: usize) -> Result<Output, 
         if n > 0 && text.len() + l.len() > max {
             break;
         }
-        text += &format!("{}\t{}\n", i + 1, l);
+        text += &format!("{}{SEP}{l}\n", i + 1);
         n += 1;
     }
     let end = offset - 1 + n;
@@ -560,6 +640,52 @@ mod tests {
         assert!(apply_edit("    foo\n", "\tfoo", "y", false, true).unwrap_err().contains("mirip"));
         assert!(!apply_edit("    foo\n", "\tfoo", "y", false, false).unwrap_err().contains("mirip"));
         assert_eq!(apply_edit("a\r\nb\r\n", "a\nb", "x\ny", false, true).unwrap(), "x\r\ny\r\n");
+    }
+
+    #[test]
+    fn nomor_baris_yang_disalin_dibuang() {
+        let e = |s: &str, o: &str, n: &str| apply_edit(s, o, n, false, true);
+        // Argumen asli gemma4, dengan pemisah lama dan baru.
+        for c in ["\t", "│", "|"] {
+            let f = |s: &str| s.replace('│', c);
+            assert_eq!(e("warna = merah\n", &f("1│warna = merah\n"), &f("1│warna = biru\n")).unwrap(), "warna = biru\n");
+            assert_eq!(e("warna = merah", &f("1│warna = merah\n"), &f("1│warna = biru\n")).unwrap(), "warna = biru");
+            assert_eq!(e("a\n\nb\n", &f("1│a\n2│\n3│b"), &f("1│a\n2│\n3│c")).unwrap(), "a\n\nc\n");
+            assert_eq!(e("a\r\nb\r\n", &f("1│a\n2│b\n"), &f("1│a\n2│c\n")).unwrap(), "a\r\nc\r\n");
+            assert_eq!(e("a\nb\n", &f("  2│b"), "c").unwrap(), "a\nc\n");
+            // Nomor menentukan tempat bila teksnya muncul beberapa kali.
+            assert_eq!(e("x\ny\nx\n", &f("3│x"), &f("3│z")).unwrap(), "x\ny\nz\n");
+            assert!(e("x\ny\nx\n", "2│x", "2│z").unwrap_err().contains("2 kali"));
+            assert!(apply_edit("a\n\nb\n", &f("2│"), "c", true, true).is_err());
+            assert!(e("a\nb\n", &f("1│a\n3│b"), "c").is_err());
+            assert!(e("a\n", &f("1│tidak ada"), "c").is_err());
+        }
+        let t = "1\tapel\t10\n2\tjeruk\t20\n";
+        assert_eq!(e(t, "2\t2\tjeruk\t20\n", "2\t2\tjeruk\t25\n").unwrap(), "1\tapel\t10\n2\tjeruk\t25\n");
+        assert!(e(t, "2\t2\tjeruk\t20", "2\tjeruk\t25").unwrap_err().contains("nomor baris"));
+        assert_eq!(e(t, "2│2\tjeruk\t20", "2│2\tjeruk\t25").unwrap(), "1\tapel\t10\n2\tjeruk\t25\n");
+        // Isi file sendiri tidak disentuh, dan tab hanya dibuang dengan bukti baris.
+        assert_eq!(e(t, "2\tjeruk", "3\tjeruk").unwrap(), "1\tapel\t10\n3\tjeruk\t20\n");
+        assert!(e("a\nb\n", "1\tb", "1\tc").is_err());
+        assert_eq!(e("a\nb\nc\n", "1│b", "1│d").unwrap(), "a\nd\nc\n");
+        assert!(e("a\nb\n", "1\ta\n2\tb", "1\ta\nx\n2\tb").is_err());
+        assert_eq!(e("a\nb\n", "1│a\n2│b", "1│a\nx\n2│b").unwrap(), "a\nx\nb\n");
+        assert_eq!(e("a\nb\n", "a", "1│c").unwrap(), "c\nb\n");
+        assert_eq!(e("a\nb\n", "a", "1\tc").unwrap(), "1\tc\nb\n");
+        assert_eq!(e("1│a\n", "1│a", "1│b").unwrap(), "1│b\n");
+        assert_eq!(e("a\nb", "b\n", "c\n").unwrap(), "a\nc");
+        let d = dir("nomor");
+        let w = |c: &str| match prepare("write", &json!({"path":"f","content":c}), &d).unwrap().action {
+            Action::Write { new, .. } => new,
+            _ => unreachable!(),
+        };
+        assert_eq!(w("1│a\n2│\n3│b\n"), "a\n\nb\n");
+        for c in ["1\ta\n2\tb\n", "1│a\nb\n", "1│a\n3│b\n", "│a\n", ""] {
+            assert_eq!(w(c), c);
+        }
+        fs::write(d.join("g"), "satu\ndua\n").unwrap();
+        let o = run(prepare("read", &json!({"path":"g"}), &d).unwrap(), &d, 32768, &Cancel::default());
+        assert_eq!(strip_copied(&o.text), "satu\ndua\n");
     }
 
     #[cfg(unix)]
