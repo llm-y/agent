@@ -1,6 +1,7 @@
 //! Instruksi proyek: AGENTS.md (atau CLAUDE.md) dari akar git sampai folder kerja,
 //! plus ~/.config/llmy/AGENTS.md. Dibatasi agar context model kecil tidak habis.
 
+use crate::sys;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -13,8 +14,7 @@ pub struct Rules {
 }
 
 fn global() -> Option<PathBuf> {
-    let abs = |k: &str| std::env::var_os(k).map(PathBuf::from).filter(|p| p.is_absolute());
-    abs("XDG_CONFIG_HOME").or_else(|| abs("HOME").map(|h| h.join(".config"))).map(|p| p.join("llmy/AGENTS.md"))
+    sys::config_dir().map(|p| p.join("AGENTS.md"))
 }
 
 pub fn load(cwd: &Path) -> Rules {
@@ -61,7 +61,7 @@ fn load_from(cwd: &Path, global: Option<PathBuf>) -> Rules {
         let cut = s.floor_char_boundary(left.min(s.len()));
         r.truncated |= cut < s.len();
         left -= cut;
-        let name = p.strip_prefix(top).unwrap_or(p).display().to_string();
+        let name = p.strip_prefix(top).unwrap_or(p).display().to_string().replace('\\', "/");
         parts.push(format!("## {name}\n{}", &s[..cut]));
         r.files.push(name);
     }
@@ -86,6 +86,7 @@ mod tests {
         fs::write(d.join("p/CLAUDE.md"), "akar").unwrap();
         fs::write(d.join("p/a/AGENTS.md"), "dekat").unwrap();
         fs::write(d.join("p/a/CLAUDE.md"), "kalah").unwrap();
+        #[cfg(unix)]
         std::os::unix::fs::symlink(d.join("AGENTS.md"), d.join("p/a/b/AGENTS.md")).unwrap();
         let r = load_from(&d.join("p/a/b"), None);
         assert_eq!(r.files, ["CLAUDE.md", "a/AGENTS.md"]);

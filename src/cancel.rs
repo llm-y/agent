@@ -1,5 +1,6 @@
 //! Pembatalan giliran: memutus soket HTTP dan membunuh grup proses `bash`.
 
+use crate::sys::kill_tree;
 use std::net::{Shutdown, TcpStream};
 use std::process::{Child, ExitStatus};
 use std::sync::Mutex;
@@ -9,14 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub struct Cancel {
     flag: AtomicBool,
     sock: Mutex<Option<TcpStream>>,
-    pgid: Mutex<Option<i32>>,
-}
-
-pub fn kill_group(pgid: i32) {
-    // SAFETY: kill() tidak menyentuh memori; pgid > 0 sehingga -pgid hanya grup itu.
-    if pgid > 1 {
-        unsafe { libc::kill(-pgid, libc::SIGKILL) };
-    }
+    pid: Mutex<Option<u32>>,
 }
 
 impl Cancel {
@@ -33,8 +27,8 @@ impl Cancel {
         if let Some(s) = self.sock.lock().unwrap().as_ref() {
             let _ = s.shutdown(Shutdown::Both);
         }
-        if let Some(p) = *self.pgid.lock().unwrap() {
-            kill_group(p);
+        if let Some(p) = *self.pid.lock().unwrap() {
+            kill_tree(p);
         }
     }
 
@@ -49,18 +43,18 @@ impl Cancel {
         }
     }
 
-    pub fn set_pgid(&self, pgid: i32) {
-        let mut g = self.pgid.lock().unwrap();
-        *g = Some(pgid);
+    pub fn set_pid(&self, pid: u32) {
+        let mut g = self.pid.lock().unwrap();
+        *g = Some(pid);
         if self.is_set() {
-            kill_group(pgid);
+            kill_tree(pid);
         }
     }
 
-    /// try_wait di bawah kunci, supaya pgid tidak pernah dibunuh setelah dipanen
+    /// try_wait di bawah kunci, supaya pid tidak pernah dibunuh setelah dipanen
     /// (nomornya bisa dipakai ulang oleh proses lain).
     pub fn reap(&self, child: &mut Child) -> std::io::Result<Option<ExitStatus>> {
-        let mut g = self.pgid.lock().unwrap();
+        let mut g = self.pid.lock().unwrap();
         let r = child.try_wait();
         if !matches!(r, Ok(None)) {
             *g = None;

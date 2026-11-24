@@ -255,7 +255,8 @@ pub fn run(cwd: PathBuf, cancel: Arc<Cancel>, tx: Sender<Ev>, rx: Receiver<Ev>, 
         hook(i);
     }));
     terminal::enable_raw_mode()?;
-    execute!(io::stdout(), event::EnableBracketedPaste)?;
+    // Di konsol Windows lama bisa tidak didukung; tempel tetap jalan sebagai ketikan.
+    let _ = execute!(io::stdout(), event::EnableBracketedPaste);
     std::thread::spawn(move || {
         while let Ok(e) = event::read() {
             if tx.send(Ev::Term(e)).is_err() {
@@ -485,8 +486,9 @@ impl Ui {
 
     fn intro(&mut self) {
         let w = self.w - 1;
-        let v = env!("CARGO_PKG_VERSION");
-        let dir = sanitize(&self.cwd.display().to_string());
+        let v = crate::VERSION;
+        // `\\?\` dari canonicalize di Windows tidak berguna bagi pembaca.
+        let dir = sanitize(self.cwd.display().to_string().trim_start_matches(r"\\?\"));
         self.print(vec![
             Row::default(),
             Row::new(BOLD, &format!("  llmy {v}"), w),
@@ -853,7 +855,8 @@ fn walk(root: &Path) -> Vec<String> {
                     dirs.push_back(e.path());
                 }
             } else if let Ok(r) = e.path().strip_prefix(root) {
-                v.push(sanitize(&r.display().to_string()));
+                let p = r.display().to_string();
+                v.push(sanitize(&if cfg!(windows) { p.replace('\\', "/") } else { p }));
             }
         }
     }

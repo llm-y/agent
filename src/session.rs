@@ -4,9 +4,9 @@
 //! Baris: {"cwd":..} kepala, {"m":pesan} tambah, {"set":[pesan]} ganti semua.
 
 use serde_json::{Value, json};
-use std::fs::{self, DirBuilder, File, OpenOptions};
+use crate::sys;
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -23,10 +23,7 @@ pub struct Entry {
 }
 
 pub fn root() -> Option<PathBuf> {
-    let abs = |k: &str| std::env::var_os(k).map(PathBuf::from).filter(|p| p.is_absolute());
-    abs("XDG_STATE_HOME")
-        .or_else(|| abs("HOME").map(|h| h.join(".local/state")))
-        .map(|p| p.join("llmy/sessions"))
+    sys::state_dir().map(|p| p.join("sessions"))
 }
 
 /// Nama folder yang terbaca + hash FNV-1a agar path berbeda tidak bertabrakan.
@@ -95,10 +92,10 @@ impl Session {
     fn open(&mut self) -> Result<&mut File, String> {
         if self.file.is_none() {
             let io = |e: std::io::Error| e.to_string();
-            DirBuilder::new().recursive(true).mode(0o700).create(&self.dir).map_err(io)?;
+            sys::private_dir(&self.dir).map_err(io)?;
             let ms = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis());
             let path = self.dir.join(format!("{ms}-{}.jsonl", std::process::id()));
-            let mut f = OpenOptions::new().append(true).create_new(true).mode(0o600).open(path).map_err(io)?;
+            let mut f = sys::private_file(&path).map_err(io)?;
             lock(&f)?;
             f.write_all(format!("{}\n", json!({"v":1,"cwd":self.cwd.to_string_lossy()})).as_bytes()).map_err(io)?;
             self.file = Some(f);
@@ -204,7 +201,9 @@ mod tests {
         s.push(&u("satu")).unwrap();
         s.push(&u("dua")).unwrap();
         let mut t = Session::new(&r, cwd);
-        assert!(t.resume(None).unwrap_err().contains("dipakai"));
+        // Di Windows kunci bersifat wajib, jadi sesi itu bahkan tak terbaca.
+        let e = t.resume(None).unwrap_err();
+        assert!(e.contains("dipakai") || cfg!(windows) && e.contains("belum ada"), "{e}");
         drop(s);
         assert_eq!(t.resume(None).unwrap(), [u("satu"), u("dua")]);
         t.set(&[u("ringkas")]).unwrap();
@@ -214,6 +213,12 @@ mod tests {
         assert_eq!(Session::new(&r, cwd).resume(Some(&id)).unwrap(), [u("ringkas"), u("tiga")]);
         assert!(Session::new(&r, Path::new("/x/b")).resume(None).is_err());
         assert!(Session::new(&r, cwd).resume(Some("../x")).is_err());
+        #[cfg(unix)]
+        hanya_pemilik(&r, cwd);
+    }
+
+    #[cfg(unix)]
+    fn hanya_pemilik(r: &Path, cwd: &Path) {
         use std::os::unix::fs::PermissionsExt;
         let d = r.join(slug(cwd));
         let f = fs::read_dir(&d).unwrap().next().unwrap().unwrap();

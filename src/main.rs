@@ -6,6 +6,7 @@ mod perm;
 mod provider;
 mod rules;
 mod session;
+mod sys;
 mod tools;
 mod ui;
 
@@ -17,6 +18,12 @@ use session::Session;
 use std::io::{IsTerminal, Read, Write};
 use std::sync::Arc;
 use std::sync::mpsc::channel;
+
+/// Diisi workflow rilis dari tag; build lokal memakai versi di Cargo.toml.
+pub const VERSION: &str = match option_env!("LLMY_VERSION") {
+    Some(v) => v,
+    None => env!("CARGO_PKG_VERSION"),
+};
 
 const HELP: &str = "llmy - agent AI CLI yang ringan
 
@@ -38,7 +45,7 @@ Opsi:
   -h, --help / -V, --version
 
 Instruksi dibaca dari AGENTS.md (atau CLAUDE.md), akar git sampai folder kerja.
-Sesi disimpan di ~/.local/state/llmy/sessions, hanya bisa dibaca pemiliknya.
+Sesi disimpan di ~/.local/state/llmy/sessions (Windows: %LOCALAPPDATA%\\llmy), hanya bisa dibaca pemiliknya.
 edit berlaku hanya di dalam folder kerja. bash berjalan dengan hak akses Anda.";
 
 struct Opts {
@@ -76,7 +83,7 @@ fn parse() -> Result<Opts, String> {
                 std::process::exit(0);
             }
             "-V" | "--version" => {
-                println!("llmy {}", env!("CARGO_PKG_VERSION"));
+                println!("llmy {VERSION}");
                 std::process::exit(0);
             }
             "-m" | "--model" => o.provider.model = val()?,
@@ -122,7 +129,13 @@ fn main() {
         (Some(id), Some(s)) => s.resume(id.as_deref()).unwrap_or_else(|e| die(&e)),
         (Some(_), None) => die("--continue/--resume tidak bisa dipakai tanpa penyimpanan sesi"),
     };
-    on_signal(cancel.clone(), interactive);
+    let c = cancel.clone();
+    sys::on_signal(move || {
+        c.cancel();
+        if interactive {
+            ui::restore();
+        }
+    });
     let agent = Agent::new(o.provider, o.perm, interactive, cwd.clone(), cancel.clone(), tx.clone())
         .with_session(session, history);
     let (ctx, crx) = channel();
@@ -162,31 +175,6 @@ fn list(session: Option<&Session>) {
         };
         println!("{:<22} {age:<15} {}", e.id, ui::sanitize(&e.title));
     }
-}
-
-/// Sinyal berhenti: matikan grup proses `bash` yang berjalan, pulihkan terminal, keluar.
-/// Diblokir sebelum thread lain dibuat; std mengosongkan mask untuk proses anak.
-fn on_signal(cancel: Arc<Cancel>, interactive: bool) {
-    // SAFETY: `set` diinisialisasi sigemptyset sebelum dipakai.
-    let set = unsafe {
-        let mut set = std::mem::zeroed::<libc::sigset_t>();
-        libc::sigemptyset(&mut set);
-        for s in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
-            libc::sigaddset(&mut set, s);
-        }
-        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
-        set
-    };
-    std::thread::spawn(move || {
-        let mut sig = 0;
-        // SAFETY: kedua pointer valid selama pemanggilan.
-        unsafe { libc::sigwait(&set, &mut sig) };
-        cancel.cancel();
-        if interactive {
-            ui::restore();
-        }
-        std::process::exit(128 + sig);
-    });
 }
 
 /// Jawaban ke stdout, jejak tool ke stderr.

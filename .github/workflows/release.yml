@@ -1,0 +1,143 @@
+# Setiap push ke main yang mengubah kode: uji dan bangun di semua platform. Bila semuanya
+# lolos, baru tag dan GitHub Release dibuat, jadi tidak pernah ada tag tanpa binary.
+#
+# Versi: belum ada tag -> versi di Cargo.toml. Cargo.toml lebih tinggi dari tag terakhir ->
+# dipakai. Selain itu dinaikkan dari tag terakhir menurut pesan commit:
+#   "#major" / "BREAKING CHANGE" -> major, "#minor" / "feat:" -> minor, lainnya -> patch.
+name: release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Tentukan versi
+        id: v
+        run: |
+          set -euo pipefail
+          cargo=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          existing=$(git tag --points-at HEAD --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1)
+          latest=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1)
+          if [ -n "$existing" ]; then
+            version=${existing#v}
+          elif [ -z "$latest" ]; then
+            version=$cargo
+          elif [ "$cargo" != "${latest#v}" ] && [ "$(printf '%s\n' "${latest#v}" "$cargo" | sort -V | tail -n1)" = "$cargo" ]; then
+            version=$cargo
+          else
+            IFS=. read -r major minor patch <<< "${latest#v}"
+            msg=$(git log --format=%B "$latest"..HEAD)
+            if grep -qE '#major|BREAKING CHANGE' <<< "$msg"; then
+              major=$((major + 1)); minor=0; patch=0
+            elif grep -qE '#minor|^feat(\(.*\))?:' <<< "$msg"; then
+              minor=$((minor + 1)); patch=0
+            else
+              patch=$((patch + 1))
+            fi
+            version=$major.$minor.$patch
+          fi
+          [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "versi tidak valid: $version" >&2; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Versi $version"
+
+  build:
+    needs: version
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
+          - { os: macos-latest, target: aarch64-apple-darwin }
+          - { os: macos-latest, target: x86_64-apple-darwin }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+    defaults:
+      run:
+        shell: bash
+    env:
+      LLMY_VERSION: ${{ needs.version.outputs.version }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal -c clippy
+          rustup default stable
+          rustup target add "$TARGET"
+      - name: Uji
+        run: |
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
+      - name: Bangun
+        run: cargo build --locked --release --target "$TARGET"
+      - name: Kemas
+        run: |
+          set -euo pipefail
+          mkdir dist
+          cp LICENSE README.md dist/
+          if [ "$RUNNER_OS" = Windows ]; then
+            cp "target/$TARGET/release/llmy.exe" dist/
+            (cd dist && 7z a "../llmy-$TARGET.zip" . > /dev/null)
+          else
+            cp "target/$TARGET/release/llmy" dist/
+            tar -czf "llmy-$TARGET.tar.gz" -C dist .
+          fi
+      - name: Cek binary
+        # macOS Intel dijalankan di runner ARM lewat Rosetta, yang belum tentu ada.
+        if: matrix.target != 'x86_64-apple-darwin'
+        run: test "$(./dist/llmy --version)" = "llmy $LLMY_VERSION"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: llmy-${{ matrix.target }}
+          path: llmy-${{ matrix.target }}.*
+          if-no-files-found: error
+
+  release:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Tag dan GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: v${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum llmy-* > SHA256SUMS
+          cat SHA256SUMS
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" --clobber ./*
+          else
+            gh release create "$TAG" --target "$GITHUB_SHA" --title "$TAG" --generate-notes ./*
+          fi

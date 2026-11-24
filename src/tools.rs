@@ -1,13 +1,13 @@
 //! Empat tool: read, write, edit, bash.
 //! `prepare` memvalidasi tanpa efek samping; `run` mengeksekusi setelah izin.
 
-use crate::cancel::{Cancel, kill_group};
+use crate::cancel::Cancel;
+use crate::sys;
 use serde_json::{Value, json};
 use std::fs;
 use std::io::Read;
-use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -75,19 +75,25 @@ pub fn resolve(cwd: &Path, p: &str) -> Result<PathBuf, String> {
         Some(r) if !r.is_empty() && fs::symlink_metadata(cwd.join(p)).is_err() => r,
         _ => p,
     };
-    let home = std::env::var("HOME").unwrap_or_default();
-    let p = match p.strip_prefix("~/") {
-        Some(r) if !home.is_empty() => Path::new(&home).join(r),
+    let p = match (p.strip_prefix("~/"), sys::home()) {
+        (Some(r), Some(h)) => h.join(r),
         _ => cwd.join(p),
     };
-    let mut out = PathBuf::from("/");
+    let mut out = PathBuf::new();
     let mut missing = false;
     for c in p.components() {
         match c {
             Component::ParentDir => {
                 out.pop();
             }
+            // Awalan drive (Windows) dan akar.
+            Component::Prefix(_) | Component::RootDir => out.push(c),
+            Component::CurDir => {}
             Component::Normal(n) => {
+                // `file:stream` di NTFS bisa menyamarkan nama seperti `.git`.
+                if cfg!(windows) && n.to_string_lossy().contains(':') {
+                    return Err("path mengandung `:`".into());
+                }
                 out.push(n);
                 if !missing {
                     match fs::canonicalize(&out) {
@@ -102,7 +108,6 @@ pub fn resolve(cwd: &Path, p: &str) -> Result<PathBuf, String> {
                     out = fs::canonicalize(&out).map_err(|e| e.to_string())?;
                 }
             }
-            _ => {}
         }
     }
     Ok(out)
@@ -110,7 +115,7 @@ pub fn resolve(cwd: &Path, p: &str) -> Result<PathBuf, String> {
 
 fn guarded(cwd: &Path, p: &Path) -> bool {
     match p.strip_prefix(cwd) {
-        Ok(r) => r.components().any(|c| c.as_os_str() == ".git"),
+        Ok(r) => r.components().any(|c| c.as_os_str().eq_ignore_ascii_case(".git")),
         Err(_) => true,
     }
 }
@@ -118,6 +123,7 @@ fn guarded(cwd: &Path, p: &Path) -> bool {
 fn show(cwd: &Path, p: &Path) -> String {
     match p.strip_prefix(cwd) {
         Ok(r) if r.as_os_str().is_empty() => ".".into(),
+        Ok(r) if cfg!(windows) => r.display().to_string().replace('\\', "/"),
         Ok(r) => r.display().to_string(),
         Err(_) => p.display().to_string(),
     }
@@ -383,15 +389,14 @@ impl Capped {
 fn bash(cmd: &str, timeout: u64, cwd: &Path, max: usize, cancel: &Cancel) -> Result<Output, String> {
     let io = |e: std::io::Error| format!("bash: {e}");
     let (mut rd, wr) = std::io::pipe().map_err(io)?;
-    let mut c = Command::new("bash");
+    let mut c = sys::shell();
     c.arg("-c").arg(cmd).current_dir(cwd).stdin(Stdio::null())
         .stdout(wr.try_clone().map_err(io)?).stderr(wr)
-        .env("PAGER", "cat").env("GIT_PAGER", "cat").env("GIT_TERMINAL_PROMPT", "0").env("TERM", "dumb")
-        .process_group(0);
+        .env("PAGER", "cat").env("GIT_PAGER", "cat").env("GIT_TERMINAL_PROMPT", "0").env("TERM", "dumb");
     let mut child = c.spawn().map_err(io)?;
     drop(c); // tutup ujung tulis milik kita agar pembaca mendapat EOF
-    let pgid = child.id() as i32;
-    cancel.set_pgid(pgid);
+    let pid = child.id();
+    cancel.set_pid(pid);
 
     let buf = Arc::new(Mutex::new(Capped::new(max)));
     let (tx, eof) = std::sync::mpsc::channel::<()>();
@@ -412,7 +417,7 @@ fn bash(cmd: &str, timeout: u64, cwd: &Path, max: usize, cancel: &Cancel) -> Res
         }
         if !timed_out && start.elapsed() > Duration::from_secs(timeout) {
             timed_out = true;
-            kill_group(pgid);
+            sys::kill_tree(pid);
         }
         std::thread::sleep(Duration::from_millis(15));
     };
@@ -461,6 +466,7 @@ mod tests {
         assert_eq!(apply_edit("a\r\nb\r\n", "a\nb", "x\ny", false, true).unwrap(), "x\r\ny\r\n");
     }
 
+    #[cfg(unix)]
     #[test]
     fn path_di_luar_dan_symlink_dijaga() {
         let d = dir("path");
@@ -484,6 +490,35 @@ mod tests {
     }
 
     #[test]
+    fn path_dasar_semua_sistem() {
+        let d = dir("path2");
+        fs::create_dir_all(d.join("in/sub")).unwrap();
+        let cwd = d.join("in");
+        let g = |p: &str| guarded(&cwd, &resolve(&cwd, p).unwrap());
+        assert!(!g("a.txt") && !g("sub/a.txt") && !g("./sub/../a.txt") && !g("baru/dua/a.txt"));
+        assert!(g("../x") && g("sub/../../x") && g("baru/../../x"));
+        assert!(g(".git/config") && g(".GIT/config") && g("sub/.git/hooks/x"));
+        assert!(g(d.join("luar.txt").to_str().unwrap()));
+        assert!(!g(cwd.join("abs.txt").to_str().unwrap()));
+        if cfg!(windows) {
+            assert!(g("C:/Windows/system.ini") && g("\\\\server\\share\\x"));
+            assert!(resolve(&cwd, ".git::$INDEX_ALLOCATION/config").is_err());
+        }
+        assert_eq!(show(&cwd, &resolve(&cwd, "sub/a.txt").unwrap()), "sub/a.txt");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bash_windows() {
+        let d = dir("bashwin");
+        let o = bash("echo hai; exit 3", 20, &d, BASH_MAX, &Cancel::default()).unwrap();
+        assert!(o.text.contains("hai") && o.text.contains("[exit 3]"), "{}", o.text);
+        let t = Instant::now();
+        assert!(bash("sleep 30", 1, &d, BASH_MAX, &Cancel::default()).unwrap().summary.contains("batas"));
+        assert!(t.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
     fn tulis_ditolak_bila_file_berubah() {
         let d = dir("toctou");
         fs::write(d.join("f"), "satu").unwrap();
@@ -502,6 +537,7 @@ mod tests {
         assert_eq!(d, " -+ ");
     }
 
+    #[cfg(unix)]
     #[test]
     fn bash_exit_timeout_latar_batal() {
         let d = dir("bash");
