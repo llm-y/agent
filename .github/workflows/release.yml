@@ -88,6 +88,12 @@ jobs:
           rustup toolchain install stable --profile minimal -c clippy
           rustup default stable
           rustup target add "$TARGET"
+      # Kripto TLS (ring) memuat kode C, jadi target musl butuh compiler musl.
+      - name: Compiler musl
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q && sudo apt-get install -yq musl-tools
+          echo "CC_${TARGET//-/_}=musl-gcc" >> "$GITHUB_ENV"
       - name: Uji
         run: |
           cargo clippy --locked --all-targets -- -D warnings

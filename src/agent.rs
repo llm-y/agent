@@ -2,7 +2,8 @@
 
 use crate::cancel::Cancel;
 use crate::perm::{Answer, Perm};
-use crate::provider::{Delta, Provider};
+use crate::anthropic::strip_thinking;
+use crate::provider::{Delta, Mode, Provider};
 use crate::rules;
 use crate::session::{self, Session};
 use crate::tools::{self, Action, Output, Prepared};
@@ -102,6 +103,8 @@ impl Agent {
     pub fn with_session(mut self, session: Option<Session>, history: Vec<Value>) -> Self {
         self.session = session;
         self.msgs.extend(history);
+        // Pesan sistem dan daftar tool bisa berbeda dari saat thinking itu dibuat.
+        strip_thinking(&mut self.msgs);
         self
     }
 
@@ -162,13 +165,14 @@ impl Agent {
         self.send(Ev::Status {
             tokens: self.used,
             ctx: self.provider.ctx,
-            model: self.provider.model.clone(),
+            model: self.provider.label(),
             think: self.provider.think,
         });
     }
 
     pub fn serve(mut self, rx: Receiver<Cmd>) {
         self.replay();
+        self.warn_remote();
         self.status();
         for cmd in rx {
             match cmd {
@@ -201,18 +205,34 @@ impl Agent {
         }
     }
 
+    /// Beri tahu bila isi percakapan meninggalkan komputer ini.
+    fn warn_remote(&self) {
+        if let Some(host) = self.provider.remote() {
+            self.send(Ev::Info(format!("Model {}: pesan dan isi file yang dibaca dikirim ke {host}", self.provider.label())));
+        }
+    }
+
     fn model(&mut self, want: Option<String>) {
-        let list = match self.provider.models(&self.cancel) {
+        let next = match want.as_deref().map(|w| self.provider.switch(w)).transpose() {
+            Ok(n) => n,
+            Err(e) => return self.send(Ev::Error(e)),
+        };
+        let list = match next.as_ref().unwrap_or(&self.provider).models(&self.cancel) {
             Ok(l) => l,
             Err(e) => return self.send(Ev::Error(e)),
         };
-        match want {
-            None => self.send(Ev::Info(format!("Model tersedia (ganti: /model <nama>):\n{}", list.join("\n")))),
-            Some(m) if list.contains(&m) => {
-                self.provider.model = m.clone();
-                self.send(Ev::Info(format!("Model sekarang {m}.")));
+        match next {
+            None => self.send(Ev::Info(format!(
+                "Model tersedia di {} (ganti: /model <nama>, /model anthropic/<nama>, /model openai/<nama>):\n{}",
+                self.provider.base, list.join("\n")
+            ))),
+            Some(p) if list.contains(&p.model) => {
+                self.provider = p;
+                (self.used, self.counted) = (0, 0);
+                self.send(Ev::Info(format!("Model sekarang {}.", self.provider.label())));
+                self.warn_remote();
             }
-            Some(m) => self.send(Ev::Error(format!("Model {m} tidak ada. Tersedia: {}", list.join(", ")))),
+            Some(p) => self.send(Ev::Error(format!("Model {} tidak ada. Tersedia: {}", p.model, list.join(", ")))),
         }
     }
 
@@ -227,7 +247,10 @@ impl Agent {
             let tx = self.tx.clone();
             let mut thought = 0;
             let mut partial = String::new();
-            let r = self.provider.chat(&self.msgs, &self.tools, &self.cancel, &mut |d| match d {
+            let r = self.provider.chat(&self.msgs, &self.tools, Mode::Turn, &self.cancel, &mut |d| match d {
+                Delta::Wait => {
+                    let _ = tx.send(Ev::Work("Server sibuk, mencoba lagi"));
+                }
                 Delta::Text(s) => {
                     partial.push_str(s);
                     let _ = tx.send(Ev::Text(s.into()));
@@ -247,6 +270,26 @@ impl Agent {
                     return self.send(if self.cancel.is_set() { Ev::Info("Dihentikan.".into()) } else { Ev::Error(e) });
                 }
             };
+            if r.stripped {
+                strip_thinking(&mut self.msgs);
+            }
+            // Jawaban terpotong atau ditolak: argumen tool bisa separuh, jadi jangan dijalankan
+            // dan jangan disimpan sebagai blok asli.
+            if matches!(r.done_reason.as_str(), "length" | "refusal") {
+                self.used = r.tokens;
+                if !r.content.trim().is_empty() {
+                    self.push(json!({"role":"assistant","content":r.content}));
+                }
+                self.counted = self.msgs.len();
+                return self.send(Ev::Error(if r.done_reason == "length" {
+                    "Jawaban terpotong: batas token tercapai. Ketik \"lanjutkan\" untuk meneruskan.".into()
+                } else {
+                    format!("Model menolak permintaan ini. {}", r.note.unwrap_or_default())
+                }));
+            }
+            if let Some(n) = &r.note {
+                self.send(Ev::Info(n.clone()));
+            }
             if r.tokens > 0 {
                 let sent = bytes(&self.msgs) + SCHEMA_BYTES + r.content.len() + r.thinking.len();
                 self.ratio = (sent as f64 / r.tokens as f64).clamp(1.2, 4.5);
@@ -260,12 +303,13 @@ impl Agent {
             if !r.calls.is_empty() {
                 m["tool_calls"] = json!(r.calls);
             }
+            if let Some(b) = r.blocks {
+                m["blocks"] = b;
+            }
             self.push(m);
             self.counted = self.msgs.len();
             if r.calls.is_empty() {
-                if r.done_reason == "length" {
-                    self.send(Ev::Error("Jawaban terpotong: batas token tercapai.".into()));
-                } else if r.content.trim().is_empty() {
+                if r.content.trim().is_empty() {
                     self.send(Ev::Info("Model tidak memberi jawaban.".into()));
                 }
                 return;
@@ -298,7 +342,15 @@ impl Agent {
     fn call(&mut self, c: &Value, history: &mut Vec<String>) -> (Output, Step) {
         let name = c["function"]["name"].as_str().unwrap_or("").to_string();
         let args = match &c["function"]["arguments"] {
-            Value::String(s) => serde_json::from_str(s).unwrap_or(Value::Null),
+            Value::String(s) => match serde_json::from_str(s) {
+                Ok(v) => v,
+                Err(_) => {
+                    let e = "argumen tool bukan JSON yang sah; kirim ulang";
+                    self.send(Ev::Tool { title: name, detail: vec![] });
+                    self.send(Ev::ToolDone { ok: false, summary: e.into() });
+                    return (Output::err(e), Step::Continue);
+                }
+            },
             v => v.clone(),
         };
         let key = format!("{name}{args}");
@@ -341,7 +393,7 @@ impl Agent {
                     let need = match &p.action {
                         Action::Bash { .. } => "jalankan ulang dengan --allow bash",
                         Action::Write { .. } if !p.guarded => "jalankan ulang dengan --allow edit",
-                        _ => "path di luar folder kerja atau di .git; pakai mode interaktif",
+                        _ => "path di luar folder kerja, di .git, atau file rahasia; pakai mode interaktif",
                     };
                     self.send(Ev::Error(format!("{} tidak diizinkan, tidak ada yang dikerjakan untuk langkah ini: {need}.", p.title)));
                     return (Output::err("ditolak"), Step::Stop);
@@ -368,7 +420,7 @@ impl Agent {
             _ => p.title.clone(),
         });
         if p.guarded {
-            question += " (di luar folder kerja atau di .git)";
+            question += " (di luar folder kerja, di .git, atau file rahasia)";
         }
         self.send(Ev::Ask { question, always: Perm::always_label(p), reply });
         rx.recv().unwrap_or(Answer::No)
@@ -424,7 +476,7 @@ impl Agent {
         let mut m = self.msgs.clone();
         shrink(&mut m, self.budget());
         m.push(json!({"role":"user","content":SUMMARIZE}));
-        let r = self.provider.chat(&m, &Value::Null, &self.cancel, &mut |_| {})?;
+        let r = self.provider.chat(&m, &self.tools, Mode::Summary, &self.cancel, &mut |_| {})?;
         let sum = r.content.trim();
         if sum.is_empty() {
             return Err("ringkasan kosong".into());
@@ -448,8 +500,13 @@ const SUMMARY: &str = "[Summary of the conversation so far]";
 /// Perkiraan ukuran skema tool yang ikut dikirim.
 const SCHEMA_BYTES: usize = 2_700;
 
+/// Ukuran pesan tanpa salinan `blocks` (isinya sama dengan content dan tool_calls).
+fn size(m: &Value) -> usize {
+    m.to_string().len() - m.get("blocks").map_or(0, |b| b.to_string().len() + 10)
+}
+
 fn bytes(m: &[Value]) -> usize {
-    m.iter().map(|m| m.to_string().len()).sum()
+    m.iter().map(size).sum()
 }
 
 const SUMMARIZE: &str = "Write notes about this conversation so the work can continue without it. Reply in the user's language, short bullet points, at most 300 words. Only facts that appear above: decisions made; files read or changed and what changed; commands run and their results; errors found. List work as remaining only if the user explicitly asked for it and it is not done; otherwise write that nothing remains. Do not guess the project's purpose, do not propose ideas. Keep exact file paths, names, and numbers. Do not call tools.";
@@ -486,13 +543,15 @@ fn tail(msgs: &[Value]) -> Vec<Value> {
         v.extend(msgs[u + a..].iter().cloned());
     }
     session::repair(&mut v);
+    // Riwayat sebelum langkah ini diganti ringkasan, jadi thinking-nya tak berlaku lagi.
+    strip_thinking(&mut v);
     v
 }
 
 const HINTED: &str = "#dialihkan";
 const HINT: &str = "bash needs the user's permission; nothing was run. Use a tool that does not: read with path \".\" lists a directory, read opens a file, grep with only glob (e.g. *.rs) finds files by name, grep with pattern searches contents. Call bash again only if these cannot do it.";
 
-const HINT_PATH: &str = "that path is outside the working directory and needs the user's permission; nothing was read. Omit path to search the working directory. Use an outside path only if the user asked for it.";
+const HINT_PATH: &str = "that path is outside the working directory or may hold secrets and needs the user's permission; nothing was read. Omit path to search the working directory. Use an outside path only if the user asked for it.";
 const MAX_HINTS: usize = 3;
 
 fn redirect(p: &Prepared) -> Option<(&'static str, &'static str)> {
@@ -521,7 +580,14 @@ fn reads_only(cmd: &str) -> bool {
 const ELIDED: &str = "[hasil lama dihapus untuk menghemat context; panggil ulang tool bila perlu]";
 
 fn shrink(msgs: &mut Vec<Value>, limit: usize) -> (usize, usize) {
-    let size = |m: &Value| m.to_string().len();
+    let n = shrink_inner(msgs, limit);
+    if n != (0, 0) {
+        strip_thinking(msgs);
+    }
+    n
+}
+
+fn shrink_inner(msgs: &mut Vec<Value>, limit: usize) -> (usize, usize) {
     let mut total: usize = msgs.iter().map(size).sum();
     let (mut cut, mut dropped) = (0, 0);
     if total <= limit {
@@ -628,6 +694,24 @@ mod tests {
         let many: Vec<_> = (0..40).map(|i| u(format!("p{i}"))).collect();
         let c = requests(&many, None);
         assert!(c.contains("> p0\n") && c.ends_with("> p39") && c.lines().count() == 15);
+    }
+
+    #[test]
+    fn mengubah_riwayat_membuang_thinking() {
+        let big = "x".repeat(5000);
+        let a = json!({"role":"assistant","content":"j","blocks":[{"type":"thinking","signature":"S"},{"type":"text","text":"j"}]});
+        let mut m = vec![json!({"role":"system","content":"s"})];
+        for _ in 0..5 {
+            m.push(json!({"role":"user","content":big}));
+            m.push(a.clone());
+        }
+        let utuh = m.clone();
+        assert_eq!(shrink(&mut m, 1_000_000), (0, 0));
+        assert_eq!(m, utuh);
+        assert!(shrink(&mut m, 12_000).1 > 0);
+        assert!(!json!(m).to_string().contains("thinking") && json!(m).to_string().contains("\"text\""));
+        assert!(!json!(tail(&utuh)).to_string().contains("thinking"));
+        assert!(size(&a) < 60);
     }
 
     #[test]

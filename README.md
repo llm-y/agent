@@ -1,7 +1,7 @@
 # agent
 
 Agentic AI CLI berbasiskan Rust. Nama perintahnya `llmy`: agent untuk terminal yang ringan,
-memakai model lokal lewat [Ollama](https://ollama.com).
+memakai model lokal lewat [Ollama](https://ollama.com), Claude, atau API kompatibel OpenAI.
 
 Instalasi dan manual: <https://ll.my.id>
 
@@ -10,7 +10,7 @@ curl -fsSL https://ll.my.id/install.sh | sh   # Linux, macOS
 irm https://ll.my.id/install.ps1 | iex        # Windows PowerShell
 ```
 
-Dari sumber (Rust 1.91+):
+Dari sumber (Rust 1.91+ dan compiler C):
 
 ```sh
 cargo install --locked --git https://github.com/llm-y/agent

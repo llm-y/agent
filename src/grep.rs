@@ -154,7 +154,7 @@ impl Walk<'_> {
             let name = name.to_string_lossy();
             // file_type() tidak mengikuti symlink, jadi symlink bukan dir maupun file.
             let Ok(t) = e.file_type() else { continue };
-            if name.starts_with('.') || t.is_dir() && SKIP.contains(&name.as_ref()) {
+            if name.starts_with('.') || crate::tools::secret(&name) || t.is_dir() && SKIP.contains(&name.as_ref()) {
                 continue;
             }
             let p = e.path();

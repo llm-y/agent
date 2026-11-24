@@ -1,8 +1,11 @@
 mod agent;
+mod anthropic;
 mod cancel;
 mod editor;
 mod grep;
 mod http;
+mod ollama;
+mod openai;
 mod perm;
 mod provider;
 mod rules;
@@ -14,7 +17,7 @@ mod ui;
 use agent::{Agent, Cmd, Ev};
 use cancel::Cancel;
 use perm::Perm;
-use provider::Provider;
+use provider::{Provider, env};
 use session::Session;
 use std::io::{IsTerminal, Read, Write};
 use std::sync::Arc;
@@ -33,10 +36,15 @@ Pakai:
   llmy [opsi] -p <prompt>  sekali jalan (stdin ikut dibaca bila dipipa)
 
 Opsi:
-  -m, --model <nama>   model Ollama      (env LLMY_MODEL, bawaan qwen3.5:9b)
-      --url <url>      alamat Ollama     (env LLMY_URL, bawaan http://localhost:11434)
-      --ctx <n>        ukuran context    (env LLMY_CTX, bawaan 32768)
-      --think          aktifkan thinking
+  -m, --model <nama>   model (env LLMY_MODEL, bawaan qwen3.5:9b)
+                         <nama>            Ollama            (alamat: LLMY_URL)
+                         anthropic/<nama>  Claude            (kunci: ANTHROPIC_API_KEY)
+                         openai/<nama>     OpenAI/kompatibel (kunci: OPENAI_API_KEY,
+                                           alamat: OPENAI_BASE_URL)
+      --url <url>      alamat untuk model yang dipilih
+      --ctx <n>        ukuran context (env LLMY_CTX; bawaan 32768, cloud sampai 200000)
+      --think          tampilkan/aktifkan thinking
+      --effort <e>     usaha model cloud: low, medium, high, xhigh, max
   -c, --continue       lanjutkan sesi terakhir di folder ini
   -r, --resume <id>    lanjutkan sesi tertentu
       --sessions       daftar sesi di folder ini
@@ -50,7 +58,6 @@ Sesi disimpan di ~/.local/state/llmy/sessions (Windows: %LOCALAPPDATA%\\llmy), h
 edit berlaku hanya di dalam folder kerja. bash berjalan dengan hak akses Anda.";
 
 struct Opts {
-    provider: Provider,
     perm: Perm,
     prompt: Option<String>,
     /// Some(None) = sesi terakhir.
@@ -59,22 +66,11 @@ struct Opts {
     list: bool,
 }
 
-fn parse() -> Result<Opts, String> {
-    let env = |k: &str, d: &str| std::env::var(k).ok().filter(|s| !s.is_empty()).unwrap_or(d.into());
-    let mut o = Opts {
-        provider: Provider {
-            base: env("LLMY_URL", "http://localhost:11434"),
-            model: env("LLMY_MODEL", "qwen3.5:9b"),
-            ctx: 0,
-            think: false,
-        },
-        perm: Perm::default(),
-        prompt: None,
-        resume: None,
-        save: true,
-        list: false,
-    };
-    let mut ctx = env("LLMY_CTX", "32768");
+fn parse() -> Result<(Opts, impl FnOnce() -> Result<Provider, String>), String> {
+    let mut o = Opts { perm: Perm::default(), prompt: None, resume: None, save: true, list: false };
+    let mut model = env("LLMY_MODEL").unwrap_or("qwen3.5:9b".into());
+    let mut ctx = env("LLMY_CTX");
+    let (mut url, mut think, mut effort) = (None, false, None);
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         let mut val = || it.next().ok_or(format!("{a} butuh nilai"));
@@ -87,14 +83,21 @@ fn parse() -> Result<Opts, String> {
                 println!("llmy {VERSION}");
                 std::process::exit(0);
             }
-            "-m" | "--model" => o.provider.model = val()?,
-            "--url" => o.provider.base = val()?,
-            "--ctx" => ctx = val()?,
+            "-m" | "--model" => model = val()?,
+            "--url" => url = Some(val()?),
+            "--ctx" => ctx = Some(val()?),
             "-c" | "--continue" => o.resume = Some(None),
             "-r" | "--resume" => o.resume = Some(Some(val()?)),
             "--sessions" => o.list = true,
             "--no-session" => o.save = false,
-            "--think" => o.provider.think = true,
+            "--think" => think = true,
+            "--effort" => {
+                let e = val()?;
+                if !["low", "medium", "high", "xhigh", "max"].contains(&e.as_str()) {
+                    return Err(format!("--effort tidak mengenal `{e}`"));
+                }
+                effort = Some(e);
+            }
             "-p" | "--print" => o.prompt = Some(val()?),
             "--allow" => {
                 for s in val()?.split(',') {
@@ -108,17 +111,23 @@ fn parse() -> Result<Opts, String> {
             _ => return Err(format!("opsi tidak dikenal: {a} (lihat --help)")),
         }
     }
-    o.provider.ctx = ctx.parse().ok().filter(|n| *n >= 4096).ok_or("ctx harus angka >= 4096")?;
-    Ok(o)
+    let ctx = ctx.map(|c| c.parse().ok().filter(|n| *n >= 4096).ok_or("ctx harus angka >= 4096")).transpose()?;
+    // Dibuat belakangan: `--sessions` tidak butuh kunci API.
+    Ok((o, move || {
+        let mut p = Provider::new(&model, url, ctx)?;
+        (p.think, p.effort) = (think, effort);
+        Ok(p)
+    }))
 }
 
 fn main() {
-    let o = parse().unwrap_or_else(|e| die(&e));
+    let (o, provider) = parse().unwrap_or_else(|e| die(&e));
     let cwd = std::env::current_dir().and_then(std::fs::canonicalize).unwrap_or_else(|e| die(&e.to_string()));
     let mut session = if o.save { session::root().map(|r| Session::new(&r, &cwd)) } else { None };
     if o.list {
         return list(session.as_ref());
     }
+    let provider = provider().unwrap_or_else(|e| die(&e));
     let cancel = Arc::new(Cancel::default());
     let (tx, rx) = channel();
     let interactive = o.prompt.is_none();
@@ -137,7 +146,7 @@ fn main() {
             ui::restore();
         }
     });
-    let agent = Agent::new(o.provider, o.perm, interactive, cwd.clone(), cancel.clone(), tx.clone())
+    let agent = Agent::new(provider, o.perm, interactive, cwd.clone(), cancel.clone(), tx.clone())
         .with_session(session, history);
     let (ctx, crx) = channel();
     std::thread::spawn(move || agent.serve(crx));

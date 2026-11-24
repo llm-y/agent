@@ -18,6 +18,7 @@ const GREP_MAX: usize = 8_000;
 
 /// Batas byte satu hasil tool: paling banyak sekitar seperempat context.
 fn cap(max: usize, ctx: u64) -> usize {
+    let max = if ctx >= 100_000 { max * 3 } else { max };
     max.min(ctx as usize * 3 / 4).max(2_000)
 }
 const FILE_MAX: u64 = 10 << 20;
@@ -118,8 +119,27 @@ pub fn resolve(cwd: &Path, p: &str) -> Result<PathBuf, String> {
     Ok(out)
 }
 
+/// File yang lazim berisi rahasia: membacanya pun ditanya, karena isinya bisa dikirim
+/// ke model di luar komputer ini.
+pub fn secret(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    if n.starts_with(".env") {
+        return ![".env.example", ".env.sample", ".env.template"].contains(&n.as_str());
+    }
+    let ext = n.rsplit_once('.').map_or("", |x| x.1);
+    matches!(n.as_str(), ".npmrc" | ".netrc" | "_netrc" | ".pgpass" | ".pypirc" | ".git-credentials" | ".htpasswd" | "credentials"
+        | "credentials.json" | "secrets.json" | "secrets.yml" | "secrets.yaml" | "id_rsa" | "id_dsa" | "id_ecdsa" | "id_ed25519"
+        | ".ssh" | ".aws" | ".gnupg" | ".kube")
+        || matches!(ext, "pem" | "key" | "p12" | "pfx" | "jks" | "keystore" | "kdbx")
+}
+
+fn has_secret(p: &Path) -> bool {
+    p.components().any(|c| secret(&c.as_os_str().to_string_lossy()))
+}
+
 fn guarded(cwd: &Path, p: &Path) -> bool {
     match p.strip_prefix(cwd) {
+        Ok(r) if has_secret(r) => true,
         Ok(r) => r.components().any(|c| c.as_os_str().eq_ignore_ascii_case(".git")),
         Err(_) => true,
     }
@@ -155,7 +175,7 @@ pub fn prepare(name: &str, a: &Value, cwd: &Path) -> Result<Prepared, String> {
             }
             Ok(Prepared {
                 title: format!("read {}", show(cwd, &path)),
-                guarded: path.strip_prefix(cwd).is_err(),
+                guarded: path.strip_prefix(cwd).map_or(true, has_secret),
                 action: Action::Read {
                     path,
                     offset: int_arg(a, "offset").unwrap_or(1).max(1) as usize,
@@ -175,7 +195,7 @@ pub fn prepare(name: &str, a: &Value, cwd: &Path) -> Result<Prepared, String> {
             let wher = show(cwd, &path);
             Ok(Prepared {
                 title: format!("grep {what}{}", if wher == "." { String::new() } else { format!("  {wher}") }),
-                guarded: path.strip_prefix(cwd).is_err(),
+                guarded: path.strip_prefix(cwd).map_or(true, has_secret),
                 action: Action::Grep { path, query: grep::Query::new(&pattern, &glob, icase)? },
             })
         }
@@ -435,6 +455,10 @@ fn bash(cmd: &str, timeout: u64, cwd: &Path, max: usize, cancel: &Cancel) -> Res
     c.arg("-c").arg(cmd).current_dir(cwd).stdin(Stdio::null())
         .stdout(wr.try_clone().map_err(io)?).stderr(wr)
         .env("PAGER", "cat").env("GIT_PAGER", "cat").env("GIT_TERMINAL_PROMPT", "0").env("TERM", "dumb");
+    // Kunci API milik llmy tidak perlu terlihat oleh perintah yang ditulis model.
+    for k in ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY"] {
+        c.env_remove(k);
+    }
     let mut child = c.spawn().map_err(io)?;
     drop(c); // tutup ujung tulis milik kita agar pembaca mendapat EOF
     let pid = child.id();
@@ -599,6 +623,21 @@ mod tests {
         let t = Instant::now();
         assert_eq!(bash("sleep 20", 30, &d, BASH_MAX, &c).unwrap().summary, "dibatalkan");
         assert!(t.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn file_rahasia_ditanya() {
+        let d = dir("rahasia");
+        for f in [".env", "kunci.pem", "a.txt", ".env.example"] {
+            fs::write(d.join(f), "x").unwrap();
+        }
+        let g = |t: &str, p: &str| prepare(t, &json!({"path":p,"pattern":"x","content":"y"}), &d).unwrap().guarded;
+        for t in ["read", "grep", "write"] {
+            assert!(g(t, ".env") && g(t, "kunci.pem") && !g(t, "a.txt") && !g(t, ".env.example"), "{t}");
+        }
+        assert!(secret(".ENV.local") && secret("ID_RSA") && !secret("environment.rs") && !secret("monkey.rs"));
+        let o = run(prepare("grep", &json!({"pattern":"x"}), &d).unwrap(), &d, 32768, &Cancel::default());
+        assert_eq!(o.text, "a.txt:1: x\n");
     }
 
     #[test]

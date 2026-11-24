@@ -1,4 +1,5 @@
-//! HTTP/1.1 minimal di atas TcpStream. Cukup untuk Ollama, tanpa TLS.
+//! HTTP/1.1 minimal, dengan TLS (rustls). Tidak mengikuti pengalihan, jadi kunci API
+//! tidak pernah terkirim ke host lain.
 
 use crate::cancel::Cancel;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -7,27 +8,97 @@ use std::time::Duration;
 
 const MAX_LINE: u64 = 8 << 20;
 
+/// Batas diam untuk https; Ollama lokal boleh lama memuat model, jadi tanpa batas.
+const IDLE: Duration = Duration::from_secs(300);
+
+pub struct Req<'a> {
+    pub base: &'a str,
+    pub method: &'a str,
+    pub path: &'a str,
+    pub headers: &'a [(&'static str, String)],
+    pub body: &'a str,
+}
+
+#[derive(Debug)]
+pub struct Fail {
+    /// 0 = gagal sebelum ada status HTTP.
+    pub status: u16,
+    pub msg: String,
+    pub retry_after: Option<u64>,
+    /// Server meminta agar tidak diulang.
+    pub no_retry: bool,
+}
+
+impl From<String> for Fail {
+    fn from(msg: String) -> Self {
+        Fail { status: 0, msg, retry_after: None, no_retry: false }
+    }
+}
+
 struct Target {
+    tls: bool,
     addr: String,
     host: String,
     prefix: String,
 }
 
 fn parse_base(base: &str) -> Result<Target, String> {
-    if base.starts_with("https://") {
-        return Err("URL https belum didukung; pakai http://".into());
-    }
-    let rest = base.strip_prefix("http://").unwrap_or(base);
+    let (tls, rest) = match base.strip_prefix("https://") {
+        Some(r) => (true, r),
+        None => (false, base.strip_prefix("http://").unwrap_or(base)),
+    };
     let (host, prefix) = match rest.find('/') {
         Some(i) => (&rest[..i], rest[i..].trim_end_matches('/')),
         None => (rest, ""),
     };
-    if host.is_empty() || host.contains(|c: char| c.is_whitespace() || c.is_control()) {
+    if host.is_empty() || host.contains(|c: char| c.is_whitespace() || c.is_control() || c == '@') {
         return Err(format!("URL tidak valid: {base}"));
     }
     let after_v6 = host.rfind(']').map_or(host, |i| &host[i..]);
-    let addr = if after_v6.contains(':') { host.to_string() } else { format!("{host}:80") };
-    Ok(Target { addr, host: host.into(), prefix: prefix.into() })
+    let port = if tls { 443 } else { 80 };
+    let addr = if after_v6.contains(':') { host.to_string() } else { format!("{host}:{port}") };
+    Ok(Target { tls, addr, host: host.into(), prefix: prefix.into() })
+}
+
+/// Apakah `base` hanya menuju komputer ini.
+pub fn is_local(base: &str) -> bool {
+    parse_base(base).is_ok_and(|t| {
+        let h = t.addr.rsplit_once(':').map_or(t.addr.as_str(), |x| x.0);
+        matches!(h, "localhost" | "[::1]") || h.parse::<std::net::Ipv4Addr>().is_ok_and(|a| a.is_loopback())
+    })
+}
+
+pub fn is_tls(base: &str) -> bool {
+    base.starts_with("https://")
+}
+
+trait Duplex: Read + Write {}
+impl<T: Read + Write> Duplex for T {}
+
+#[cfg(feature = "tls")]
+fn wrap_tls(sock: TcpStream, t: &Target) -> Result<Box<dyn Duplex>, String> {
+    use std::sync::{Arc, OnceLock};
+    static CFG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
+    let cfg = CFG.get_or_init(|| {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let c = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("versi TLS bawaan")
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        Arc::new(c)
+    });
+    let name = t.addr.rsplit_once(':').map_or(t.addr.as_str(), |x| x.0).to_string();
+    let name = rustls::pki_types::ServerName::try_from(name).map_err(|e| format!("nama host: {e}"))?;
+    let conn = rustls::ClientConnection::new(cfg.clone(), name).map_err(|e| format!("TLS: {e}"))?;
+    Ok(Box::new(rustls::StreamOwned::new(conn, sock)))
+}
+
+#[cfg(not(feature = "tls"))]
+fn wrap_tls(_: TcpStream, _: &Target) -> Result<Box<dyn Duplex>, String> {
+    Err("dibangun tanpa TLS; https tidak tersedia".into())
 }
 
 /// Pembaca body: chunked, content-length, atau sampai koneksi ditutup.
@@ -73,16 +144,13 @@ impl<R: BufRead> Read for Body<R> {
 }
 
 /// Kirim request; `on_line` dipanggil untuk tiap baris body.
-/// Status selain 2xx dikembalikan sebagai Err berisi isi body.
+/// Status selain 2xx dikembalikan sebagai Fail berisi isi body.
 pub fn request(
-    base: &str,
-    method: &str,
-    path: &str,
-    body: &str,
+    req: &Req,
     cancel: &Cancel,
     on_line: &mut dyn FnMut(&str) -> Result<(), String>,
-) -> Result<(), String> {
-    let t = parse_base(base)?;
+) -> Result<(), Fail> {
+    let t = parse_base(req.base)?;
     let addrs = t.addr.to_socket_addrs().map_err(|e| format!("alamat {}: {e}", t.addr))?;
     let mut last = format!("alamat {} tidak ditemukan", t.addr);
     let mut sock = None;
@@ -92,48 +160,67 @@ pub fn request(
                 sock = Some(s);
                 break;
             }
-            Err(e) => last = format!("tidak bisa terhubung ke {base}: {e}"),
+            Err(e) => last = format!("tidak bisa terhubung ke {}: {e}", req.base),
         }
     }
     let sock = sock.ok_or(last)?;
     let _ = sock.set_nodelay(true);
     cancel.set_sock(sock.try_clone().ok());
-    let r = exchange(sock, &t, method, path, body, on_line);
+    let r = exchange(sock, &t, req, on_line);
     cancel.set_sock(None);
-    if cancel.is_set() { Err("dibatalkan".into()) } else { r }
+    if cancel.is_set() { Err("dibatalkan".to_string().into()) } else { r }
 }
 
 fn exchange(
-    mut sock: TcpStream,
+    sock: TcpStream,
     t: &Target,
-    method: &str,
-    path: &str,
-    body: &str,
+    req: &Req,
     on_line: &mut dyn FnMut(&str) -> Result<(), String>,
-) -> Result<(), String> {
-    let io = |e: std::io::Error| format!("koneksi: {e}");
-    let head = format!(
-        "{method} {}{path} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        t.prefix, t.host, body.len()
+) -> Result<(), Fail> {
+    let io = |e: std::io::Error| Fail::from(format!("koneksi: {e}"));
+    let mut s: Box<dyn Duplex> = if t.tls {
+        let _ = sock.set_read_timeout(Some(IDLE));
+        let _ = sock.set_write_timeout(Some(IDLE));
+        wrap_tls(sock, t)?
+    } else {
+        Box::new(sock)
+    };
+    let mut head = format!(
+        "{} {}{} HTTP/1.1\r\nHost: {}\r\nUser-Agent: llmy\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+        req.method, t.prefix, req.path, t.host, req.body.len()
     );
-    sock.write_all(head.as_bytes()).map_err(io)?;
-    sock.write_all(body.as_bytes()).map_err(io)?;
-    read_response(BufReader::new(sock), on_line)
+    for (k, v) in req.headers {
+        if v.contains(|c: char| c.is_control() || !c.is_ascii()) {
+            return Err(format!("nilai header {k} mengandung karakter tidak sah").into());
+        }
+        head += &format!("{k}: {v}\r\n");
+    }
+    head += "\r\n";
+    s.write_all(head.as_bytes()).map_err(io)?;
+    s.write_all(req.body.as_bytes()).map_err(io)?;
+    s.flush().map_err(io)?;
+    read_response(BufReader::new(s), on_line)
 }
 
 fn read_response<R: BufRead>(
     mut r: R,
     on_line: &mut dyn FnMut(&str) -> Result<(), String>,
-) -> Result<(), String> {
-    let io = |e: std::io::Error| format!("koneksi: {e}");
+) -> Result<(), Fail> {
+    let io = |e: std::io::Error| {
+        Fail::from(match e.kind() {
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => "server diam terlalu lama".to_string(),
+            _ => format!("koneksi: {e}"),
+        })
+    };
     let mut line = String::new();
     (&mut r).take(8192).read_line(&mut line).map_err(io)?;
     let status: u16 = line
         .split_whitespace()
         .nth(1)
         .and_then(|s| s.parse().ok())
-        .ok_or("balasan HTTP tidak valid")?;
+        .ok_or("balasan HTTP tidak valid".to_string())?;
     let (mut chunked, mut len) = (false, u64::MAX);
+    let (mut retry_after, mut no_retry) = (None, false);
     for _ in 0..200 {
         line.clear();
         (&mut r).take(16384).read_line(&mut line).map_err(io)?;
@@ -144,6 +231,8 @@ fn read_response<R: BufRead>(
         if let Some((k, v)) = l.split_once(':') {
             match k.to_ascii_lowercase().as_str() {
                 "transfer-encoding" => chunked = v.to_ascii_lowercase().contains("chunked"),
+                "retry-after" => retry_after = v.trim().parse().ok(),
+                "x-should-retry" => no_retry = v.trim() == "false",
                 "content-length" => len = v.trim().parse().unwrap_or(u64::MAX),
                 _ => {}
             }
@@ -158,7 +247,8 @@ fn read_response<R: BufRead>(
     if !(200..300).contains(&status) {
         let mut b = Vec::new();
         let _ = body.take(64 << 10).read_to_end(&mut b);
-        return Err(format!("HTTP {status}: {}", String::from_utf8_lossy(&b).trim()));
+        let msg = format!("HTTP {status}: {}", error_text(&String::from_utf8_lossy(&b)));
+        return Err(Fail { status, msg, retry_after, no_retry });
     }
     let mut buf = Vec::new();
     loop {
@@ -174,11 +264,20 @@ fn read_response<R: BufRead>(
     }
 }
 
+/// Ambil pesan dari badan error JSON: {"error": "..."} atau {"error": {"message": "..."}}.
+fn error_text(b: &str) -> String {
+    let v: serde_json::Value = serde_json::from_str(b).unwrap_or_default();
+    let e = &v["error"];
+    let m = e["message"].as_str().or(e.as_str()).unwrap_or(b.trim());
+    let kind = e["details"]["error_code"].as_str().map(|c| format!(" ({c})")).unwrap_or_default();
+    m.chars().take(1000).collect::<String>() + &kind
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn run(raw: &str) -> (Result<(), String>, Vec<String>) {
+    fn run(raw: &str) -> (Result<(), Fail>, Vec<String>) {
         let mut v = vec![];
         let r = read_response(raw.as_bytes(), &mut |l| {
             v.push(l.to_string());
@@ -204,7 +303,10 @@ mod tests {
     #[test]
     fn status_error_memuat_body() {
         let (r, _) = run("HTTP/1.1 400 Bad\r\nContent-Length: 3\r\n\r\nabc");
-        assert_eq!(r.unwrap_err(), "HTTP 400: abc");
+        assert_eq!(r.unwrap_err().msg, "HTTP 400: abc");
+        let (r, _) = run("HTTP/1.1 429 X\r\nRetry-After: 7\r\nx-should-retry: false\r\n\r\n{\"error\":{\"message\":\"pelan\"}}");
+        let e = r.unwrap_err();
+        assert_eq!((e.status, e.msg.as_str(), e.retry_after, e.no_retry), (429, "HTTP 429: pelan", Some(7), true));
     }
 
     #[test]
@@ -212,6 +314,14 @@ mod tests {
         let t = parse_base("http://localhost:11434/x/").unwrap();
         assert_eq!((t.addr.as_str(), t.prefix.as_str()), ("localhost:11434", "/x"));
         assert_eq!(parse_base("http://[::1]").unwrap().addr, "[::1]:80");
-        assert!(parse_base("https://a").is_err());
+        let t = parse_base("https://a.b/v1").unwrap();
+        assert!(t.tls && t.addr == "a.b:443" && t.prefix == "/v1");
+        assert!(parse_base("https://user@a").is_err() && parse_base("http://a b").is_err());
+        for l in ["http://localhost:1", "http://127.0.0.1", "http://[::1]:9"] {
+            assert!(is_local(l), "{l}");
+        }
+        for l in ["http://localhost.evil.com", "http://127.0.0.1.evil.com", "https://a.b", "http://10.0.0.1"] {
+            assert!(!is_local(l), "{l}");
+        }
     }
 }
