@@ -6,6 +6,7 @@ use crate::cancel::Cancel;
 use crate::http::{self, Fail, Req};
 use crate::ollama;
 use crate::openai;
+use crate::text;
 use serde_json::Value;
 use std::time::{Duration, Instant};
 
@@ -54,6 +55,8 @@ pub struct Provider {
     pub max_out: u64,
     pub think: bool,
     pub effort: Option<String>,
+    /// Tool lewat teks, untuk server yang tidak meneruskan `tools`.
+    pub text_tools: bool,
     ctx_user: Option<u64>,
     probed: bool,
 }
@@ -102,6 +105,7 @@ impl Provider {
             max_out: 32_000,
             think: false,
             effort: None,
+            text_tools: false,
             ctx_user: ctx,
             probed: false,
         };
@@ -113,7 +117,7 @@ impl Provider {
     pub fn switch(&self, spec: &str) -> Result<Provider, String> {
         let same = split(spec).0 == self.kind;
         let mut p = Provider::new(spec, same.then(|| self.base.clone()), self.ctx_user)?;
-        (p.think, p.effort) = (self.think, self.effort.clone());
+        (p.think, p.effort, p.text_tools) = (self.think, self.effort.clone(), self.text_tools);
         Ok(p)
     }
 
@@ -144,13 +148,16 @@ impl Provider {
             Kind::OpenAi => (env("OPENAI_API_KEY").map(|k| ("Authorization", format!("Bearer {k}"))), "OPENAI_API_KEY"),
         };
         let local = http::is_local(&self.base);
+        let lan = http::is_lan(&self.base);
         let mut v = vec![];
         match h {
+            // Server di jaringan lokal (vLLM, LM Studio): jalan tanpa kunci, kunci tidak dikirim.
+            Some(_) if self.key_withheld() => {}
             Some(_) if !local && !http::is_tls(&self.base) => {
                 return Err(format!("{name} tidak dikirim lewat http ke {}; pakai https", self.base));
             }
             Some(h) => v.push(h),
-            None if !local => return Err(format!("{name} belum diatur untuk {}", self.label())),
+            None if !local && !lan => return Err(format!("{name} belum diatur untuk {}", self.label())),
             None => {}
         }
         if self.kind == Kind::Anthropic {
@@ -159,7 +166,32 @@ impl Provider {
         Ok(v)
     }
 
+    /// http biasa ke jaringan lokal: kunci akan terbaca di jalan, jadi tidak dikirim.
+    fn key_withheld(&self) -> bool {
+        http::is_lan(&self.base) && !http::is_tls(&self.base)
+    }
+
     pub fn chat(
+        &mut self,
+        msgs: &[Value],
+        tools: &Value,
+        mode: Mode,
+        cancel: &Cancel,
+        on: &mut dyn FnMut(Delta),
+    ) -> Result<Reply, String> {
+        if !self.text_tools {
+            return self.send(msgs, tools, mode, cancel, on);
+        }
+        let mut f = text::Filter::default();
+        let mut r = self.send(&text::convert(msgs, tools, mode), &Value::Null, mode, cancel, &mut |d| match d {
+            Delta::Text(s) => f.push(s, on),
+            d => on(d),
+        })?;
+        f.finish(&mut r, on);
+        Ok(r)
+    }
+
+    fn send(
         &mut self,
         msgs: &[Value],
         tools: &Value,
@@ -226,6 +258,10 @@ impl Provider {
 
     fn explain(&self, e: Fail) -> String {
         let hint = match (e.status, self.kind) {
+            (401 | 403, _) if self.kind != Kind::Ollama && self.key_withheld() => " (kunci tidak dikirim lewat http; pakai https atau terowongan ssh)",
+            (400, _) if !self.text_tools && ["support tools", "tool choice requires"].iter().any(|s| e.msg.contains(s)) => {
+                " (coba --tools text)"
+            }
             (401 | 403, Kind::Anthropic) => " (periksa ANTHROPIC_API_KEY)",
             (401 | 403, Kind::OpenAi) => " (periksa OPENAI_API_KEY)",
             (404, _) => " (periksa nama model: /model)",

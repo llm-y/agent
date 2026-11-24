@@ -11,6 +11,7 @@ mod provider;
 mod rules;
 mod session;
 mod sys;
+mod text;
 mod tools;
 mod ui;
 
@@ -43,6 +44,8 @@ Opsi:
                                            alamat: OPENAI_BASE_URL)
       --url <url>      alamat untuk model yang dipilih
       --ctx <n>        ukuran context (env LLMY_CTX; bawaan 32768, cloud sampai 200000)
+      --tools <cara>   native (bawaan) atau text: tool lewat teks, untuk server
+                       yang tidak meneruskan tool calling (env LLMY_TOOLS)
       --think          tampilkan/aktifkan thinking
       --effort <e>     usaha model cloud: low, medium, high, xhigh, max
   -c, --continue       lanjutkan sesi terakhir di folder ini
@@ -70,6 +73,7 @@ fn parse() -> Result<(Opts, impl FnOnce() -> Result<Provider, String>), String> 
     let mut o = Opts { perm: Perm::default(), prompt: None, resume: None, save: true, list: false };
     let mut model = env("LLMY_MODEL").unwrap_or("qwen3.5:9b".into());
     let mut ctx = env("LLMY_CTX");
+    let mut tools = env("LLMY_TOOLS").unwrap_or("native".into());
     let (mut url, mut think, mut effort) = (None, false, None);
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -90,6 +94,7 @@ fn parse() -> Result<(Opts, impl FnOnce() -> Result<Provider, String>), String> 
             "-r" | "--resume" => o.resume = Some(Some(val()?)),
             "--sessions" => o.list = true,
             "--no-session" => o.save = false,
+            "--tools" => tools = val()?,
             "--think" => think = true,
             "--effort" => {
                 let e = val()?;
@@ -112,10 +117,15 @@ fn parse() -> Result<(Opts, impl FnOnce() -> Result<Provider, String>), String> 
         }
     }
     let ctx = ctx.map(|c| c.parse().ok().filter(|n| *n >= 4096).ok_or("ctx harus angka >= 4096")).transpose()?;
+    let text = match tools.as_str() {
+        "native" => false,
+        "text" => true,
+        _ => return Err(format!("--tools tidak mengenal `{tools}` (native atau text)")),
+    };
     // Dibuat belakangan: `--sessions` tidak butuh kunci API.
     Ok((o, move || {
         let mut p = Provider::new(&model, url, ctx)?;
-        (p.think, p.effort) = (think, effort);
+        (p.think, p.effort, p.text_tools) = (think, effort, text);
         Ok(p)
     }))
 }

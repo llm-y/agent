@@ -22,13 +22,20 @@ fn once(
         let mut m = m.clone();
         if let Some(o) = m.as_object_mut() {
             o.shift_remove("blocks");
+            // Argumen yang bukan JSON sah (dari provider lain) ditolak Ollama.
+            for c in o.get_mut("tool_calls").and_then(Value::as_array_mut).into_iter().flatten() {
+                if !c["function"]["arguments"].is_object() {
+                    c["function"]["arguments"] = json!({});
+                }
+            }
         }
         m
     }).collect();
     let mut body = json!({"model": p.model, "messages": msgs, "stream": true, "options": {"num_ctx": p.ctx}});
-    if mode == Mode::Turn {
+    if mode == Mode::Turn && tools.is_array() {
         body["tools"] = tools.clone();
-    } else {
+    }
+    if mode == Mode::Summary {
         body["options"]["num_predict"] = json!(1200);
     }
     if let Some(t) = think {

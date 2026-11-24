@@ -121,12 +121,14 @@ fn body(p: &Provider, msgs: &[Value], tools: &Value, mode: Mode) -> Value {
         "max_tokens": if mode == Mode::Turn { p.max_out } else { p.max_out.min(8_000) },
         "stream": true,
         "system": [{"type":"text","text":system,"cache_control":{"type":"ephemeral"}}],
-        // Sama di setiap permintaan, juga saat meringkas: daftar tool bagian dari riwayat.
-        "tools": convert_tools(tools, official),
         "messages": messages,
     });
-    if mode == Mode::Summary {
-        b["tool_choice"] = json!({"type":"none"});
+    if tools.is_array() {
+        // Sama di setiap permintaan, juga saat meringkas: daftar tool bagian dari riwayat.
+        b["tools"] = json!(convert_tools(tools, official));
+        if mode == Mode::Summary {
+            b["tool_choice"] = json!({"type":"none"});
+        }
     }
     if let Some(e) = &p.effort {
         b["output_config"] = json!({"effort": e});

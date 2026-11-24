@@ -47,7 +47,7 @@ pub fn chat(p: &Provider, msgs: &[Value], tools: &Value, mode: Mode, cancel: &Ca
         "model": p.model, "messages": convert(msgs), "stream": true,
         "stream_options": {"include_usage": true},
     });
-    if mode == Mode::Turn {
+    if mode == Mode::Turn && tools.is_array() {
         body["tools"] = tools.clone();
     }
     if let Some(e) = &p.effort {

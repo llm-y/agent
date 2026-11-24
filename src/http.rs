@@ -68,6 +68,27 @@ pub fn is_local(base: &str) -> bool {
     })
 }
 
+/// Apakah `base` menunjuk komputer lain di jaringan lokal (alamat privat atau nama lokal).
+pub fn is_lan(base: &str) -> bool {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    parse_base(base).is_ok_and(|t| {
+        let h = t.addr.rsplit_once(':').map_or(t.addr.as_str(), |x| x.0);
+        if let Some(v6) = h.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            return v6.parse::<Ipv6Addr>().is_ok_and(|a| a.is_unique_local() || a.is_unicast_link_local());
+        }
+        if let Ok(a) = h.parse::<Ipv4Addr>() {
+            let o = a.octets();
+            // 100.64/10: CGNAT, dipakai Tailscale.
+            return a.is_private() || a.is_link_local() || (o[0] == 100 && (64..128).contains(&o[1]));
+        }
+        let h = h.to_ascii_lowercase();
+        // Nama berawalan angka bisa berarti alamat IP dalam bentuk lain.
+        h.starts_with(|c: char| c.is_ascii_alphabetic())
+            && h != "localhost"
+            && (!h.contains('.') || [".local", ".lan", ".home.arpa", ".internal"].iter().any(|s| h.ends_with(s)))
+    })
+}
+
 pub fn is_tls(base: &str) -> bool {
     base.starts_with("https://")
 }
@@ -322,6 +343,12 @@ mod tests {
         }
         for l in ["http://localhost.evil.com", "http://127.0.0.1.evil.com", "https://a.b", "http://10.0.0.1"] {
             assert!(!is_local(l), "{l}");
+        }
+        for l in ["http://10.0.0.1", "http://192.168.1.5:8000/v1", "http://172.31.0.1", "http://100.100.1.1", "http://gpu:8000", "http://gpu.local/v1", "http://[fd00::1]:1", "http://[fe80::1]"] {
+            assert!(is_lan(l) && !is_local(l), "{l}");
+        }
+        for l in ["http://localhost", "http://127.0.0.1", "http://8.8.8.8", "http://172.32.0.1", "http://100.128.0.1", "http://a.b", "http://x.local.evil.com", "http://134744072", "http://0x8080808", "http://[2001:db8::1]"] {
+            assert!(!is_lan(l), "{l}");
         }
     }
 }
