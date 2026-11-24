@@ -1,0 +1,43 @@
+# Sesudah rilis (atau manual): pasang dari ll.my.id seperti pengguna, lalu cek versinya.
+name: install-test
+
+on:
+  workflow_run:
+    workflows: [release]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unix:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - run: |
+          curl -fsSL https://ll.my.id/install.sh | sh
+          ~/.local/bin/llmy --version
+
+  windows:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [pwsh, powershell]
+    steps:
+      - if: matrix.shell == 'pwsh'
+        shell: pwsh
+        run: |
+          irm https://ll.my.id/install.ps1 | iex
+          llmy --version
+      - if: matrix.shell == 'powershell'
+        shell: powershell
+        run: |
+          irm https://ll.my.id/install.ps1 | iex
+          llmy --version

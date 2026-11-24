@@ -52,11 +52,14 @@ impl Session {
         let mut v: Vec<Entry> = fs::read_dir(&self.dir).into_iter().flatten().flatten()
             .filter_map(|e| {
                 let id = e.file_name().to_str()?.strip_suffix(".jsonl")?.to_string();
-                let raw = fs::read(e.path()).ok()?;
-                let title = load(&raw, &self.cwd)?.iter()
-                    .find(|m| m["role"] == "user")
-                    .and_then(|m| m["content"].as_str())
-                    .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(60).collect())?;
+                let title = match fs::read(e.path()) {
+                    Ok(raw) => load(&raw, &self.cwd)?.iter()
+                        .find(|m| m["role"] == "user")
+                        .and_then(|m| m["content"].as_str())
+                        .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(60).collect())?,
+                    // Di Windows kunci bersifat wajib: sesi yang aktif tak bisa dibaca.
+                    Err(_) => "(sedang dipakai)".to_string(),
+                };
                 Some(Entry { id, modified: e.metadata().ok()?.modified().ok()?, title })
             })
             .collect();
@@ -201,9 +204,7 @@ mod tests {
         s.push(&u("satu")).unwrap();
         s.push(&u("dua")).unwrap();
         let mut t = Session::new(&r, cwd);
-        // Di Windows kunci bersifat wajib, jadi sesi itu bahkan tak terbaca.
-        let e = t.resume(None).unwrap_err();
-        assert!(e.contains("dipakai") || cfg!(windows) && e.contains("belum ada"), "{e}");
+        assert!(t.resume(None).unwrap_err().contains("dipakai"));
         drop(s);
         assert_eq!(t.resume(None).unwrap(), [u("satu"), u("dua")]);
         t.set(&[u("ringkas")]).unwrap();

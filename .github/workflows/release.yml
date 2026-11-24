@@ -29,7 +29,7 @@ jobs:
     outputs:
       version: ${{ steps.v.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Tentukan versi
@@ -82,7 +82,7 @@ jobs:
       LLMY_VERSION: ${{ needs.version.outputs.version }}
       TARGET: ${{ matrix.target }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Rust
         run: |
           rustup toolchain install stable --profile minimal -c clippy
@@ -110,7 +110,7 @@ jobs:
         # macOS Intel dijalankan di runner ARM lewat Rosetta, yang belum tentu ada.
         if: matrix.target != 'x86_64-apple-darwin'
         run: test "$(./dist/llmy --version)" = "llmy $LLMY_VERSION"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: llmy-${{ matrix.target }}
           path: llmy-${{ matrix.target }}.*
@@ -122,7 +122,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
