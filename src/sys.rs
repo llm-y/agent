@@ -7,6 +7,11 @@ fn abs(k: &str) -> Option<PathBuf> {
     std::env::var_os(k).map(PathBuf::from).filter(|p| p.is_absolute())
 }
 
+/// FNV-1a 64 bit; hasilnya sama di semua versi dan sistem.
+pub fn fnv(b: &[u8]) -> u64 {
+    b.iter().fold(0xcbf29ce484222325, |h, b| (h ^ *b as u64).wrapping_mul(0x100000001b3))
+}
+
 pub fn home() -> Option<PathBuf> {
     abs("HOME").or_else(|| abs("USERPROFILE"))
 }

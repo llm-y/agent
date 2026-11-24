@@ -114,7 +114,7 @@ fn convert_tools(tools: &Value, eager: bool) -> Vec<Value> {
 }
 
 fn body(p: &Provider, msgs: &[Value], tools: &Value, mode: Mode) -> Value {
-    let official = p.base == BASE;
+    let official = p.official();
     let (system, messages) = convert(msgs);
     let mut b = json!({
         "model": p.model,
@@ -135,6 +135,9 @@ fn body(p: &Provider, msgs: &[Value], tools: &Value, mode: Mode) -> Value {
     }
     if p.think {
         b["thinking"] = json!({"type":"adaptive","display":"summarized"});
+    }
+    if p.no_think {
+        b["thinking"] = json!({"type":"disabled"});
     }
     if official && has_fallback(&p.model) {
         b["fallbacks"] = json!("default");

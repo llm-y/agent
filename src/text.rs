@@ -132,6 +132,7 @@ impl Filter {
     pub fn finish(mut self, r: &mut Reply, on: &mut dyn FnMut(Delta)) {
         r.blocks = None;
         r.thinking.clear();
+        r.reasoning.clear();
         if matches!(r.done_reason.as_str(), "length" | "refusal") {
             // Terpotong: blok yang tertahan mungkin separuh, jangan ditampilkan atau dijalankan.
             r.content = self.all[..self.line.max(self.shown).min(self.all.len())].trim_end().into();

@@ -29,7 +29,7 @@ pub fn root() -> Option<PathBuf> {
 /// Nama folder yang terbaca + hash FNV-1a agar path berbeda tidak bertabrakan.
 fn slug(cwd: &Path) -> String {
     let s = cwd.to_string_lossy();
-    let h = s.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3));
+    let h = sys::fnv(s.as_bytes());
     let name = cwd.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let name: String = name.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').take(40).collect();
     format!("{name}-{h:016x}")

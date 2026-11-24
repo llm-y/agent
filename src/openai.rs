@@ -5,8 +5,10 @@ use crate::http::{self, Fail, Req};
 use crate::provider::{Delta, Mode, Provider, Reply, sse};
 use serde_json::{Value, json};
 
+pub const BASE: &str = "https://api.openai.com/v1";
+
 /// Riwayat netral -> format OpenAI. Hasil tool dipasangkan menurut urutan.
-fn convert(msgs: &[Value]) -> Vec<Value> {
+fn convert(msgs: &[Value], echo: bool) -> Vec<Value> {
     let mut out = vec![];
     let mut wait: std::collections::VecDeque<String> = Default::default();
     for (i, m) in msgs.iter().enumerate() {
@@ -29,6 +31,10 @@ fn convert(msgs: &[Value]) -> Vec<Value> {
                 } else if m["content"].as_str().is_none_or(str::is_empty) {
                     continue;
                 }
+                if echo {
+                    // Wajib ada di setiap jawaban, juga yang tanpa thinking.
+                    o["reasoning_content"] = json!(m["reasoning"].as_str().unwrap_or(""));
+                }
                 out.push(o);
             }
             Some("tool") => {
@@ -43,15 +49,19 @@ fn convert(msgs: &[Value]) -> Vec<Value> {
 }
 
 pub fn chat(p: &Provider, msgs: &[Value], tools: &Value, mode: Mode, cancel: &Cancel, on: &mut dyn FnMut(Delta)) -> Result<Reply, Fail> {
+    let with_tools = mode == Mode::Turn && tools.is_array();
     let mut body = json!({
-        "model": p.model, "messages": convert(msgs), "stream": true,
+        "model": p.model, "messages": convert(msgs, p.echo && with_tools), "stream": true,
         "stream_options": {"include_usage": true},
     });
-    if mode == Mode::Turn && tools.is_array() {
+    if with_tools {
         body["tools"] = tools.clone();
     }
     if let Some(e) = &p.effort {
         body["reasoning_effort"] = json!(e);
+    }
+    if p.no_think {
+        body["thinking"] = json!({"type":"disabled"});
     }
     let mut out = Reply::default();
     let mut calls: Vec<(String, String)> = vec![];
@@ -78,7 +88,7 @@ pub fn chat(p: &Provider, msgs: &[Value], tools: &Value, mode: Mode, cancel: &Ca
         let m = &c["delta"];
         for k in ["reasoning_content", "reasoning"] {
             if let Some(s) = m[k].as_str().filter(|s| !s.is_empty()) {
-                out.thinking.push_str(s);
+                out.reasoning.push_str(s);
                 on(Delta::Think);
             }
         }
@@ -112,8 +122,6 @@ pub fn chat(p: &Provider, msgs: &[Value], tools: &Value, mode: Mode, cancel: &Ca
         "content_filter" => "refusal",
         _ => "stop",
     }.into();
-    // thinking bukan bagian riwayat di format ini
-    out.thinking.clear();
     out.calls = calls.into_iter().filter(|c| !c.0.is_empty()).map(|(name, args)| {
         // JSON tak sah dibiarkan sebagai teks; pemanggil menolaknya sebagai argumen salah.
         let a = if args.trim().is_empty() { json!({}) } else { serde_json::from_str(&args).unwrap_or(Value::String(args)) };
@@ -137,11 +145,26 @@ mod tests {
             json!({"role":"tool","content":"dua"}),
             json!({"role":"assistant","content":""}),
         ];
-        let o = convert(&m);
+        let o = convert(&m, false);
         assert_eq!(o.len(), 5);
         assert_eq!(o[2]["tool_calls"][0]["function"]["arguments"], "{\"path\":\"a\"}");
         assert_eq!(o[2]["tool_calls"][1]["id"], o[4]["tool_call_id"]);
         assert_eq!(o[3]["content"], "satu");
         assert!(o[2]["blocks"].is_null());
+        assert!(!json!(o).to_string().contains("reasoning"));
+    }
+
+    #[test]
+    fn reasoning_hanya_bila_diminta() {
+        let m = [
+            json!({"role":"user","content":"u"}),
+            json!({"role":"assistant","content":"a","reasoning":"R"}),
+            json!({"role":"assistant","content":"b","thinking":"T"}),
+        ];
+        let o = convert(&m, true);
+        assert_eq!((&o[1]["reasoning_content"], &o[2]["reasoning_content"]), (&json!("R"), &json!("")));
+        assert!(o[0]["reasoning_content"].is_null());
+        let o = json!(convert(&m, false)).to_string();
+        assert!(!o.contains("reasoning") && !o.contains('T'));
     }
 }

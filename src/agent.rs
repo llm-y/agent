@@ -273,8 +273,11 @@ impl Agent {
             let mut thought = 0;
             let mut partial = String::new();
             let r = self.provider.chat(&self.msgs, &self.tools, Mode::Turn, &self.cancel, &mut |d| match d {
-                Delta::Wait => {
-                    let _ = tx.send(Ev::Work("Server sibuk, mencoba lagi"));
+                Delta::Work(s) => {
+                    let _ = tx.send(Ev::Work(s));
+                }
+                Delta::Note(s) => {
+                    let _ = tx.send(Ev::Info(s.into()));
                 }
                 Delta::Text(s) => {
                     partial.push_str(s);
@@ -316,7 +319,7 @@ impl Agent {
                 self.send(Ev::Info(n.clone()));
             }
             if r.tokens > 0 {
-                let sent = bytes(&self.msgs) + SCHEMA_BYTES + r.content.len() + r.thinking.len();
+                let sent = bytes(&self.msgs) + SCHEMA_BYTES + r.content.len() + r.thinking.len() + r.reasoning.len();
                 self.ratio = (sent as f64 / r.tokens as f64).clamp(1.2, 4.5);
             }
             self.used = r.tokens;
@@ -324,6 +327,9 @@ impl Agent {
             let mut m = json!({"role":"assistant","content":r.content});
             if !r.thinking.is_empty() {
                 m["thinking"] = json!(r.thinking);
+            }
+            if !r.reasoning.is_empty() {
+                m["reasoning"] = json!(r.reasoning);
             }
             if !r.calls.is_empty() {
                 m["tool_calls"] = json!(r.calls);
@@ -548,9 +554,11 @@ const SUMMARY: &str = "[Summary of the conversation so far]";
 /// Perkiraan ukuran skema tool yang ikut dikirim.
 const SCHEMA_BYTES: usize = 3_300;
 
-/// Ukuran pesan tanpa salinan `blocks` (isinya sama dengan content dan tool_calls).
+/// Ukuran pesan tanpa salinan `blocks` (isinya sama dengan content dan tool_calls) dan
+/// `reasoning` (umumnya tidak dikirim).
 fn size(m: &Value) -> usize {
-    m.to_string().len() - m.get("blocks").map_or(0, |b| b.to_string().len() + 10)
+    let skip = |k: &str| m.get(k).map_or(0, |b| b.to_string().len() + k.len() + 4);
+    m.to_string().len() - skip("blocks") - skip("reasoning")
 }
 
 fn bytes(m: &[Value]) -> usize {

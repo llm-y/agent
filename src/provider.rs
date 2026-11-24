@@ -3,6 +3,7 @@
 
 use crate::anthropic;
 use crate::cancel::Cancel;
+use crate::detect::{self, Tools};
 use crate::http::{self, Fail, Req};
 use crate::ollama;
 use crate::openai;
@@ -20,8 +21,9 @@ pub enum Kind {
 pub enum Delta<'a> {
     Text(&'a str),
     Think,
-    /// Menunggu sebelum mencoba lagi.
-    Wait,
+    /// Kegiatan selain menjawab, mis. menunggu sebelum mencoba lagi.
+    Work(&'static str),
+    Note(&'static str),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -35,6 +37,8 @@ pub enum Mode {
 pub struct Reply {
     pub content: String,
     pub thinking: String,
+    /// Thinking ala OpenAI (`reasoning_content`); dikirim balik hanya bila server memintanya.
+    pub reasoning: String,
     pub calls: Vec<Value>,
     /// Blok asli Anthropic, harus dikirim balik persis sama.
     pub blocks: Option<Value>,
@@ -55,8 +59,14 @@ pub struct Provider {
     pub max_out: u64,
     pub think: bool,
     pub effort: Option<String>,
+    pub tools: Tools,
     /// Tool lewat teks, untuk server yang tidak meneruskan `tools`.
     pub text_tools: bool,
+    /// Server mewajibkan `reasoning_content` dikirim balik.
+    pub echo: bool,
+    /// Server tetap menolak riwayat thinking: matikan thinking.
+    pub no_think: bool,
+    pub detected: bool,
     ctx_user: Option<u64>,
     probed: bool,
 }
@@ -91,7 +101,7 @@ impl Provider {
         let base = url.unwrap_or_else(|| match kind {
             Kind::Ollama => env("LLMY_URL").unwrap_or("http://localhost:11434".into()),
             Kind::Anthropic => env("ANTHROPIC_BASE_URL").unwrap_or(anthropic::BASE.into()),
-            Kind::OpenAi => env("OPENAI_BASE_URL").unwrap_or("https://api.openai.com/v1".into()),
+            Kind::OpenAi => env("OPENAI_BASE_URL").unwrap_or(openai::BASE.into()),
         });
         let p = Provider {
             kind,
@@ -105,7 +115,11 @@ impl Provider {
             max_out: 32_000,
             think: false,
             effort: None,
+            tools: Tools::Auto,
             text_tools: false,
+            echo: false,
+            no_think: false,
+            detected: false,
             ctx_user: ctx,
             probed: false,
         };
@@ -117,8 +131,13 @@ impl Provider {
     pub fn switch(&self, spec: &str) -> Result<Provider, String> {
         let same = split(spec).0 == self.kind;
         let mut p = Provider::new(spec, same.then(|| self.base.clone()), self.ctx_user)?;
-        (p.think, p.effort, p.text_tools) = (self.think, self.effort.clone(), self.text_tools);
+        (p.think, p.effort) = (self.think, self.effort.clone());
+        p.set_tools(self.tools);
         Ok(p)
+    }
+
+    pub fn set_tools(&mut self, t: Tools) {
+        (self.tools, self.text_tools) = (t, t == Tools::Text);
     }
 
     pub fn label(&self) -> String {
@@ -179,16 +198,30 @@ impl Provider {
         cancel: &Cancel,
         on: &mut dyn FnMut(Delta),
     ) -> Result<Reply, String> {
+        self.detect(cancel, on);
         if !self.text_tools {
-            return self.send(msgs, tools, mode, cancel, on);
+            match self.send(msgs, tools, mode, cancel, on) {
+                Err(e) if self.tools == Tools::Auto && detect::refuses(&e) && !cancel.is_set() => self.use_text(on),
+                r => return r.map_err(|e| self.explain(e)),
+            }
         }
         let mut f = text::Filter::default();
-        let mut r = self.send(&text::convert(msgs, tools, mode), &Value::Null, mode, cancel, &mut |d| match d {
+        let r = self.send(&text::convert(msgs, tools, mode), &Value::Null, mode, cancel, &mut |d| match d {
             Delta::Text(s) => f.push(s, on),
             d => on(d),
-        })?;
+        });
+        let mut r = r.map_err(|e| self.explain(e))?;
         f.finish(&mut r, on);
         Ok(r)
+    }
+
+    /// Satu permintaan, tanpa diulang.
+    pub fn once(&self, msgs: &[Value], tools: &Value, mode: Mode, cancel: &Cancel, on: &mut dyn FnMut(Delta)) -> Result<Reply, Fail> {
+        match self.kind {
+            Kind::Ollama => ollama::chat(self, msgs, tools, mode, cancel, on),
+            Kind::Anthropic => anthropic::chat(self, msgs, tools, mode, cancel, on),
+            Kind::OpenAi => openai::chat(self, msgs, tools, mode, cancel, on),
+        }
     }
 
     fn send(
@@ -198,7 +231,7 @@ impl Provider {
         mode: Mode,
         cancel: &Cancel,
         on: &mut dyn FnMut(Delta),
-    ) -> Result<Reply, String> {
+    ) -> Result<Reply, Fail> {
         self.probe(cancel);
         let mut owned: Option<Vec<Value>> = None;
         let mut attempt = 0;
@@ -209,12 +242,7 @@ impl Provider {
                 emitted = true;
                 on(d);
             };
-            let r = match self.kind {
-                Kind::Ollama => ollama::chat(self, m, tools, mode, cancel, &mut tap),
-                Kind::Anthropic => anthropic::chat(self, m, tools, mode, cancel, &mut tap),
-                Kind::OpenAi => openai::chat(self, m, tools, mode, cancel, &mut tap),
-            };
-            let e = match r {
+            let e = match self.once(m, tools, mode, cancel, &mut tap) {
                 Ok(mut r) => {
                     r.stripped = owned.is_some();
                     return Ok(r);
@@ -222,7 +250,7 @@ impl Provider {
                 Err(e) => e,
             };
             if cancel.is_set() || emitted {
-                return Err(e.msg);
+                return Err(e);
             }
             // Riwayat berubah sejak thinking dibuat: buang thinking, coba sekali lagi.
             if e.status == 400 && owned.is_none() && e.msg.contains("bound to a different conversation") {
@@ -231,20 +259,44 @@ impl Provider {
                 owned = Some(v);
                 continue;
             }
+            if self.adapt(&e, on) {
+                continue;
+            }
             let wait = e.retry_after.unwrap_or(1 << attempt);
             if !self.retryable(&e) || attempt >= RETRIES || wait > 60 {
-                return Err(self.explain(e));
+                return Err(e);
             }
             attempt += 1;
-            on(Delta::Wait);
+            on(Delta::Work("Server sibuk, mencoba lagi"));
             let until = Instant::now() + Duration::from_secs(wait);
             while Instant::now() < until {
                 if cancel.is_set() {
-                    return Err("dibatalkan".into());
+                    return Err(Fail::from("dibatalkan".to_string()));
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
         }
+    }
+
+    /// Server kompatibel (DeepSeek, Kimi) bisa mewajibkan thinking dikirim balik. Kirim; bila
+    /// masih ditolak (mis. bagian riwayat tanpa thinking), matikan thinking.
+    fn adapt(&mut self, e: &Fail, on: &mut dyn FnMut(Delta)) -> bool {
+        let about = match self.kind {
+            Kind::OpenAi => e.msg.contains("reasoning_content"),
+            Kind::Anthropic => !self.official() && e.msg.contains("thinking"),
+            Kind::Ollama => false,
+        };
+        if !matches!(e.status, 400 | 422) || !about || self.no_think {
+            return false;
+        }
+        if self.kind == Kind::OpenAi && !self.echo {
+            self.echo = true;
+            self.learn("reasoning", true.into());
+        } else {
+            self.no_think = true;
+            on(Delta::Note("Server menolak riwayat thinking; thinking dimatikan untuk model ini."));
+        }
+        true
     }
 
     fn retryable(&self, e: &Fail) -> bool {
@@ -259,7 +311,7 @@ impl Provider {
     fn explain(&self, e: Fail) -> String {
         let hint = match (e.status, self.kind) {
             (401 | 403, _) if self.kind != Kind::Ollama && self.key_withheld() => " (kunci tidak dikirim lewat http; pakai https atau terowongan ssh)",
-            (400, _) if !self.text_tools && ["support tools", "tool choice requires"].iter().any(|s| e.msg.contains(s)) => {
+            _ if !self.text_tools && detect::refuses(&e) => {
                 " (coba --tools text)"
             }
             (401 | 403, Kind::Anthropic) => " (periksa ANTHROPIC_API_KEY)",
