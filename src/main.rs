@@ -1,6 +1,7 @@
 mod agent;
 mod cancel;
 mod editor;
+mod grep;
 mod http;
 mod perm;
 mod provider;

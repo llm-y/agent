@@ -1,7 +1,8 @@
-//! Empat tool: read, write, edit, bash.
+//! Lima tool: read, grep, edit, write, bash.
 //! `prepare` memvalidasi tanpa efek samping; `run` mengeksekusi setelah izin.
 
 use crate::cancel::Cancel;
+use crate::grep;
 use crate::sys;
 use serde_json::{Value, json};
 use std::fs;
@@ -13,6 +14,7 @@ use std::time::{Duration, Instant};
 
 const READ_MAX: usize = 16_000;
 const BASH_MAX: usize = 8_000;
+const GREP_MAX: usize = 8_000;
 
 /// Batas byte satu hasil tool: paling banyak sekitar seperempat context.
 fn cap(max: usize, ctx: u64) -> usize {
@@ -30,17 +32,20 @@ pub fn schema() -> Value {
     json!([
         f("read", "Read a text file (with line numbers) or list a directory.",
           json!({"path": s("File or directory path, relative to the working directory"), "offset": i("First line, 1-based"), "limit": i("Number of lines")}), &["path"]),
+        f("grep", "Search file contents with a regex, or list files by glob when pattern is omitted. Skips hidden files and build output. Use this instead of bash for searching.",
+          json!({"pattern": s("Regular expression"), "path": s("File or directory, relative to the working directory; default ."), "glob": s("File name filter, e.g. *.rs or src/**/*.ts"), "ignore_case": {"type":"boolean"}}), &[]),
         f("edit", "Replace exact text in a file. `old` must match exactly, including indentation, and occur once unless replace_all is true. Do not include line numbers.",
           json!({"path": s("File path, relative to the working directory"), "old": s("Exact existing text"), "new": s("Replacement text"), "replace_all": {"type":"boolean"}}), &["path", "old", "new"]),
         f("write", "Create a new file or overwrite a whole file. Prefer edit for existing files.",
           json!({"path": s("File path, relative to the working directory"), "content": s("Full file content")}), &["path", "content"]),
-        f("bash", "Run a bash command in the working directory. Use it for search (grep, find), build, test, git.",
+        f("bash", "Run a bash command in the working directory. Use it for build, test, git; not for reading or searching files.",
           json!({"command": s("Command"), "timeout": i("Seconds, default 120, max 600")}), &["command"]),
     ])
 }
 
 pub enum Action {
     Read { path: PathBuf, offset: usize, limit: usize },
+    Grep { path: PathBuf, query: grep::Query },
     Write { path: PathBuf, old: Option<String>, new: String, is_edit: bool },
     Bash { cmd: String, timeout: u64 },
 }
@@ -158,6 +163,22 @@ pub fn prepare(name: &str, a: &Value, cwd: &Path) -> Result<Prepared, String> {
                 },
             })
         }
+        "grep" => {
+            let opt = |k: &str| if a[k].is_null() { Ok(String::new()) } else { str_arg(a, k) };
+            let (pattern, glob, at) = (opt("pattern")?, opt("glob")?, opt("path")?);
+            let path = resolve(cwd, if at.trim().is_empty() { "." } else { &at })?;
+            if !path.exists() {
+                return Err(format!("{} tidak ada. Pakai path relatif terhadap folder kerja", show(cwd, &path)));
+            }
+            let icase = a["ignore_case"].as_bool().unwrap_or(false) || a["ignore_case"] == "true";
+            let what: String = [pattern.trim(), glob.trim()].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("  ");
+            let wher = show(cwd, &path);
+            Ok(Prepared {
+                title: format!("grep {what}{}", if wher == "." { String::new() } else { format!("  {wher}") }),
+                guarded: path.strip_prefix(cwd).is_err(),
+                action: Action::Grep { path, query: grep::Query::new(&pattern, &glob, icase)? },
+            })
+        }
         "write" => {
             let path = resolve(cwd, &str_arg(a, "path")?)?;
             let new = str_arg(a, "content")?;
@@ -191,7 +212,7 @@ pub fn prepare(name: &str, a: &Value, cwd: &Path) -> Result<Prepared, String> {
             let timeout = int_arg(a, "timeout").unwrap_or(120).clamp(1, 600);
             Ok(Prepared { title: "bash".into(), guarded: false, action: Action::Bash { cmd, timeout } })
         }
-        _ => Err(format!("tool `{name}` tidak ada. Yang tersedia: read, edit, write, bash")),
+        _ => Err(format!("tool `{name}` tidak ada. Yang tersedia: read, grep, edit, write, bash")),
     }
 }
 
@@ -272,6 +293,9 @@ impl Output {
 pub fn run(p: Prepared, cwd: &Path, ctx: u64, cancel: &Cancel) -> Output {
     match p.action {
         Action::Read { path, offset, limit } => read(&path, offset, limit, cap(READ_MAX, ctx)).unwrap_or_else(Output::err),
+        Action::Grep { path, query } => {
+            search(&query, &path, cwd, cap(GREP_MAX, ctx), cancel).unwrap_or_else(Output::err)
+        }
         Action::Write { path, old, new, is_edit } => write(&path, old, &new, is_edit).unwrap_or_else(Output::err),
         Action::Bash { cmd, timeout } => bash(&cmd, timeout, cwd, cap(BASH_MAX, ctx), cancel).unwrap_or_else(Output::err),
     }
@@ -315,6 +339,24 @@ fn read(path: &Path, offset: usize, limit: usize, max: usize) -> Result<Output, 
         text += &format!("... {} baris lagi; lanjut dengan offset={}\n", total - end, end + 1);
     }
     let summary = if n == total { format!("{n} baris") } else { format!("baris {offset}-{end} dari {total}") };
+    Ok(Output { text, summary, ok: true })
+}
+
+fn search(q: &grep::Query, path: &Path, cwd: &Path, max: usize, cancel: &Cancel) -> Result<Output, String> {
+    let r = grep::run(q, path, cwd, max, cancel)?;
+    let mut summary = format!("{} hasil di {} file", r.hits, r.files);
+    let mut text = match (r.hits, r.names.is_empty()) {
+        (0, true) => "(tidak ada yang cocok)\n".to_string(),
+        (0, false) => {
+            summary = format!("{} nama file cocok", r.names.len());
+            format!("No file content matches. File names that match:\n{}\n", r.names.join("\n"))
+        }
+        _ => r.text,
+    };
+    if let Some(c) = r.cut {
+        text += &format!("... [{c}]\n");
+        summary += " (tidak lengkap)";
+    }
     Ok(Output { text, summary, ok: true })
 }
 
@@ -557,6 +599,23 @@ mod tests {
         let t = Instant::now();
         assert_eq!(bash("sleep 20", 30, &d, BASH_MAX, &c).unwrap().summary, "dibatalkan");
         assert!(t.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn grep_izin_dan_argumen() {
+        let d = dir("grepizin");
+        fs::create_dir(d.join("in")).unwrap();
+        fs::write(d.join("in/a.txt"), "halo").unwrap();
+        let cwd = d.join("in");
+        let p = |v: Value| prepare("grep", &v, &cwd);
+        assert!(!p(json!({"pattern":"x"})).unwrap().guarded);
+        assert!(!p(json!({"pattern":"x","path":"a.txt"})).unwrap().guarded);
+        assert!(p(json!({"pattern":"x","path":".."})).unwrap().guarded);
+        assert!(p(json!({})).is_err() && p(json!({"pattern":"x","path":"tak-ada"})).is_err());
+        let o = run(p(json!({"pattern":"HALO","ignore_case":true})).unwrap(), &cwd, 32768, &Cancel::default());
+        assert_eq!((o.text.as_str(), o.summary.as_str()), ("a.txt:1: halo\n", "1 hasil di 1 file"));
+        let o = run(p(json!({"pattern":"nihil"})).unwrap(), &cwd, 32768, &Cancel::default());
+        assert!(o.ok && o.text.contains("tidak ada"));
     }
 
     #[test]

@@ -72,7 +72,7 @@ fn system_prompt(cwd: &std::path::Path, rules: &str) -> String {
          Rules:\n\
          - Reply in the user's language. Be brief and direct.\n\
          - Always use paths relative to the working directory, e.g. src/main.rs.\n\
-         - Use tools to find facts. Never guess file contents; read a file before you edit it.\n\
+         - Use tools to find facts: grep to search, read to open files. Never guess file contents; read a file before you edit it.\n\
          - Make the smallest change that solves the task. Do not touch unrelated code.\n\
          - Use edit for existing files and write only for new files.\n\
          - After changing code, check it by running the project's build or tests when available.\n\
@@ -318,6 +318,15 @@ impl Agent {
             }
         };
         self.send(Ev::Tool { title: p.title.clone(), detail: detail(&p) });
+        // Arahkan ke cara tanpa izin dulu, alih-alih langsung mengganggu pengguna.
+        if !self.perm.auto(&p)
+            && let Some((hint, short)) = redirect(&p)
+            && history.iter().filter(|h| *h == HINTED).count() < MAX_HINTS
+        {
+            history.insert(0, HINTED.into());
+            self.send(Ev::ToolDone { ok: false, summary: short.into() });
+            return (Output::err(hint), Step::Continue);
+        }
         if !self.perm.auto(&p) {
             match self.ask(&p) {
                 Answer::Yes => {}
@@ -437,7 +446,7 @@ impl Agent {
 
 const SUMMARY: &str = "[Summary of the conversation so far]";
 /// Perkiraan ukuran skema tool yang ikut dikirim.
-const SCHEMA_BYTES: usize = 2_000;
+const SCHEMA_BYTES: usize = 2_700;
 
 fn bytes(m: &[Value]) -> usize {
     m.iter().map(|m| m.to_string().len()).sum()
@@ -478,6 +487,35 @@ fn tail(msgs: &[Value]) -> Vec<Value> {
     }
     session::repair(&mut v);
     v
+}
+
+const HINTED: &str = "#dialihkan";
+const HINT: &str = "bash needs the user's permission; nothing was run. Use a tool that does not: read with path \".\" lists a directory, read opens a file, grep with only glob (e.g. *.rs) finds files by name, grep with pattern searches contents. Call bash again only if these cannot do it.";
+
+const HINT_PATH: &str = "that path is outside the working directory and needs the user's permission; nothing was read. Omit path to search the working directory. Use an outside path only if the user asked for it.";
+const MAX_HINTS: usize = 3;
+
+fn redirect(p: &Prepared) -> Option<(&'static str, &'static str)> {
+    match &p.action {
+        Action::Bash { cmd, .. } if reads_only(cmd) => Some((HINT, "dialihkan ke read/grep")),
+        Action::Grep { .. } => Some((HINT_PATH, "dialihkan ke folder kerja")),
+        _ => None,
+    }
+}
+
+/// Perintah yang jelas hanya melihat atau mencari file. Hanya dipakai untuk memberi
+/// saran, bukan untuk meloloskan izin.
+fn reads_only(cmd: &str) -> bool {
+    // `cd folder && ls` sama saja dengan `ls`.
+    let cmd = match cmd.trim().strip_prefix("cd ").and_then(|r| r.split_once("&&")) {
+        Some((d, rest)) if !d.contains([';', '|', '`', '$', '\n']) => rest.trim(),
+        _ => cmd,
+    };
+    let first = cmd.split_whitespace().next().unwrap_or("");
+    let quiet = cmd.replace("2>/dev/null", "").replace("2>&1", "");
+    matches!(first, "ls" | "find" | "grep" | "rg" | "cat" | "head" | "tail" | "tree")
+        && !quiet.contains(['>', ';', '&', '`', '\n'])
+        && !["$(", "-exec", "-delete", "xargs", "tee "].iter().any(|b| quiet.contains(b))
 }
 
 const ELIDED: &str = "[hasil lama dihapus untuk menghemat context; panggil ulang tool bila perlu]";
@@ -531,7 +569,7 @@ fn shrink(msgs: &mut Vec<Value>, limit: usize) -> (usize, usize) {
 
 fn detail(p: &Prepared) -> Detail {
     match &p.action {
-        Action::Read { .. } => vec![],
+        Action::Read { .. } | Action::Grep { .. } => vec![],
         // Perintah selalu tampil utuh: pengguna menyetujui apa yang ia lihat.
         Action::Bash { cmd, .. } => cmd.lines().map(|l| ('$', 0, l.to_string())).collect(),
         Action::Write { old, new, .. } => {
@@ -549,6 +587,16 @@ fn detail(p: &Prepared) -> Detail {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saran_hanya_untuk_perintah_baca() {
+        for c in ["ls -la", "find . -name '*.rs' 2>/dev/null | head", "grep -rn x src", "cat a.txt", "cd /x/y && grep -r a . 2>/dev/null | head -3"] {
+            assert!(reads_only(c), "{c}");
+        }
+        for c in ["cargo test", "ls; rm x", "find . -delete", "find . -exec rm {} +", "cat a > b", "ls && make", "cat $(x)", "", "lsof", "cd x && rm y", "cd x && ls && rm y", "cd $(rm x) && ls"] {
+            assert!(!reads_only(c), "{c}");
+        }
+    }
 
     #[test]
     fn shrink_menjaga_pasangan() {

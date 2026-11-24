@@ -10,6 +10,7 @@ homepage = "https://ll.my.id"
 
 [dependencies]
 crossterm = { version = "0.29", default-features = false, features = ["events", "bracketed-paste"] }
+regex-lite = "0.1"
 serde_json = { version = "1", features = ["preserve_order"] }
 unicode-width = { version = "0.2", default-features = false }
 

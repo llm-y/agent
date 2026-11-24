@@ -21,7 +21,7 @@ pub enum Answer {
 impl Perm {
     pub fn auto(&self, p: &Prepared) -> bool {
         match &p.action {
-            Action::Read { .. } => !p.guarded,
+            Action::Read { .. } | Action::Grep { .. } => !p.guarded,
             Action::Write { .. } => self.allow_edit && !p.guarded,
             Action::Bash { cmd, .. } => self.allow_bash || self.bash_exact.contains(cmd),
         }
@@ -31,7 +31,7 @@ impl Perm {
     pub fn always_label(p: &Prepared) -> Option<&'static str> {
         match &p.action {
             _ if p.guarded => None,
-            Action::Read { .. } => None,
+            Action::Read { .. } | Action::Grep { .. } => None,
             Action::Write { .. } => Some("Ya, selalu untuk edit di folder ini selama sesi"),
             Action::Bash { .. } => Some("Ya, selalu untuk perintah persis ini selama sesi"),
         }
@@ -40,7 +40,7 @@ impl Perm {
     pub fn remember(&mut self, p: &Prepared) {
         match &p.action {
             _ if p.guarded => {}
-            Action::Read { .. } => {}
+            Action::Read { .. } | Action::Grep { .. } => {}
             Action::Write { .. } => self.allow_edit = true,
             Action::Bash { cmd, .. } => {
                 self.bash_exact.insert(cmd.clone());
