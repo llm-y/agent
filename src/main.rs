@@ -1,8 +1,10 @@
 mod agent;
 mod anthropic;
+mod api;
 mod cancel;
 mod detect;
 mod editor;
+mod gemini;
 mod grep;
 mod http;
 mod memory;
@@ -38,14 +40,19 @@ const HELP: &str = "llmy - agent AI CLI yang ringan
 Pakai:
   llmy [opsi]              mode interaktif
   llmy [opsi] -p <prompt>  sekali jalan (stdin ikut dibaca bila dipipa)
+  llmy api [perintah]      atur API beberapa provider (set, list, use, remove)
 
 Opsi:
-  -m, --model <nama>   model (env LLMY_MODEL, bawaan qwen3.5:9b)
+  -m, --model <nama>   model (env LLMY_MODEL, bawaan qwen3.5:9b atau profil bawaan)
                          <nama>            Ollama            (alamat: LLMY_URL)
                          anthropic/<nama>  Claude            (kunci: ANTHROPIC_API_KEY)
                          openai/<nama>     OpenAI/kompatibel (kunci: OPENAI_API_KEY,
                                            alamat: OPENAI_BASE_URL)
+                         gemini/<nama>     Google Gemini     (kunci: GEMINI_API_KEY,
+                                           alamat: GEMINI_BASE_URL)
+                         <profil>/<nama>   profil tersimpan dari `llmy api`
       --url <url>      alamat untuk model yang dipilih
+      --api-key <key>  kunci API hanya untuk sesi ini (tidak disimpan)
       --ctx <n>        ukuran context (env LLMY_CTX; bawaan 32768, cloud sampai 200000)
       --tools <cara>   auto (bawaan), native, atau text: tool lewat teks, untuk server
                        tanpa tool calling. auto mencoba native dulu (env LLMY_TOOLS)
@@ -61,6 +68,7 @@ Opsi:
 
 Instruksi dibaca dari AGENTS.md (atau CLAUDE.md), akar git sampai folder kerja.
 Memori: bagian Memory di AGENTS.md proyek, atau ~/.config/llmy/AGENTS.md untuk semua proyek.
+API tersimpan di ~/.config/llmy/api.json (Windows: %APPDATA%\\llmy), hanya bisa dibaca pemiliknya.
 Sesi disimpan di ~/.local/state/llmy/sessions (Windows: %LOCALAPPDATA%\\llmy), hanya bisa dibaca pemiliknya.
 edit berlaku hanya di dalam folder kerja. bash berjalan dengan hak akses Anda.";
 
@@ -73,12 +81,26 @@ struct Opts {
     list: bool,
 }
 
+fn default_model() -> String {
+    let cfg = api::Config::load();
+    if let Some(def) = cfg.default {
+        if let Some(m) = cfg.providers.get(&def).and_then(|p| p.model.as_deref()) {
+            return format!("{def}/{m}");
+        }
+        if def == "ollama" {
+            return "qwen3.5:9b".into();
+        }
+        return def;
+    }
+    "qwen3.5:9b".into()
+}
+
 fn parse() -> Result<(Opts, impl FnOnce() -> Result<Provider, String>), String> {
     let mut o = Opts { perm: Perm::default(), prompt: None, resume: None, save: true, list: false };
-    let mut model = env("LLMY_MODEL").unwrap_or("qwen3.5:9b".into());
+    let mut model = env("LLMY_MODEL").unwrap_or_else(default_model);
     let mut ctx = env("LLMY_CTX");
     let mut tools = env("LLMY_TOOLS").unwrap_or("auto".into());
-    let (mut url, mut think, mut effort) = (None, false, None);
+    let (mut url, mut api_key, mut think, mut effort) = (None, None, false, None);
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         let mut val = || it.next().ok_or(format!("{a} butuh nilai"));
@@ -93,6 +115,7 @@ fn parse() -> Result<(Opts, impl FnOnce() -> Result<Provider, String>), String> 
             }
             "-m" | "--model" => model = val()?,
             "--url" => url = Some(val()?),
+            "--api-key" => api_key = Some(val()?),
             "--ctx" => ctx = Some(val()?),
             "-c" | "--continue" => o.resume = Some(None),
             "-r" | "--resume" => o.resume = Some(Some(val()?)),
@@ -125,7 +148,7 @@ fn parse() -> Result<(Opts, impl FnOnce() -> Result<Provider, String>), String> 
     let tools = Tools::parse(&tools).ok_or(format!("--tools tidak mengenal `{tools}` (auto, native, atau text)"))?;
     // Dibuat belakangan: `--sessions` tidak butuh kunci API.
     Ok((o, move || {
-        let mut p = Provider::new(&model, url, ctx)?;
+        let mut p = Provider::with_options(&model, url, api_key, ctx, Default::default())?;
         (p.think, p.effort) = (think, effort);
         p.set_tools(tools);
         Ok(p)
@@ -133,6 +156,10 @@ fn parse() -> Result<(Opts, impl FnOnce() -> Result<Provider, String>), String> 
 }
 
 fn main() {
+    let raw_args: Vec<String> = std::env::args().collect();
+    if raw_args.get(1).map(String::as_str) == Some("api") {
+        std::process::exit(api::cli(&raw_args[2..]));
+    }
     let (o, provider) = parse().unwrap_or_else(|e| die(&e));
     let cwd = std::env::current_dir().and_then(std::fs::canonicalize).unwrap_or_else(|e| die(&e.to_string()));
     let mut session = if o.save { session::root().map(|r| Session::new(&r, &cwd)) } else { None };

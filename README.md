@@ -1,10 +1,11 @@
 # agent
 
 Agentic AI CLI berbasiskan Rust. Nama perintahnya `llmy`: agent untuk terminal yang ringan,
-memakai model lokal lewat [Ollama](https://ollama.com), Claude, atau API kompatibel OpenAI.
+memakai model lokal lewat [Ollama](https://ollama.com), Claude, Google Gemini, atau API kompatibel OpenAI.
 
-Memori cukup di `AGENTS.md`: bagian `## Memory` milik proyek, atau `~/.config/llmy/AGENTS.md`
-yang terbawa ke semua proyek. Tanpa database.
+Simpan dan pilih API dari beberapa provider lewat `llmy api set` (disimpan di `~/.config/llmy/api.json`,
+hanya terbaca pemilik) atau `/api` di dalam sesi. Memori cukup di `AGENTS.md`: bagian `## Memory`
+milik proyek, atau `~/.config/llmy/AGENTS.md` yang terbawa ke semua proyek. Tanpa database.
 
 Instalasi dan manual: <https://ll.my.id>
 

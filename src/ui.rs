@@ -27,9 +27,10 @@ const SPIN: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'
 /// berjalan tidak ikut menyetujui.
 const ASK_GUARD: Duration = Duration::from_millis(500);
 
-const COMMANDS: [(&str, &str); 9] = [
+const COMMANDS: [(&str, &str); 10] = [
     ("/help", "bantuan"),
     ("/model", "lihat atau ganti model"),
+    ("/api", "atur atau pilih API provider"),
     ("/think", "aktif/nonaktifkan thinking"),
     ("/compact", "ringkas percakapan untuk menghemat context"),
     ("/remember", "simpan fakta: /remember <fakta> atau /remember all <fakta>"),
@@ -633,7 +634,8 @@ impl Ui {
         if self.busy {
             return self.queue.push_back(t);
         }
-        self.lines(DIM, "› ", &t);
+        let shown = if t.starts_with("/api ") { crate::api::mask_command_display(&t) } else { t.clone() };
+        self.lines(DIM, "› ", &shown);
         // Hanya kata tanpa '/' kedua dianggap perintah, jadi path absolut tetap pesan biasa.
         let (name, arg) = t.split_once(char::is_whitespace).unwrap_or((&t, ""));
         if !name.starts_with('/') || name[1..].contains('/') {
@@ -651,6 +653,7 @@ impl Ui {
                 let a = arg.trim();
                 self.start(Cmd::Model((!a.is_empty()).then(|| a.to_string())));
             }
+            "/api" => self.start(Cmd::Api(arg.trim().into())),
             "/copy" => {
                 let b = base64(self.last_answer.trim().as_bytes());
                 self.erase();
@@ -763,7 +766,7 @@ impl Ui {
                 let (pick, whole) = (self.popup[self.popup_sel].0.clone(), self.ed.text());
                 self.accept();
                 // Perintah tanpa argumen langsung dijalankan.
-                if pick.starts_with('/') && pick != "/model" || whole == pick {
+                if pick.starts_with('/') && !matches!(pick.as_str(), "/model" | "/api") || whole == pick {
                     let s = self.ed.take();
                     self.submit(s);
                 }
@@ -804,7 +807,7 @@ impl Ui {
 
     fn accept(&mut self) {
         let pick = self.popup[self.popup_sel].0.clone();
-        let tail = if pick.starts_with('@') || pick == "/model" { " " } else { "" };
+        let tail = if pick.starts_with('@') || matches!(pick.as_str(), "/model" | "/api") { " " } else { "" };
         self.ed.replace_token(&format!("{pick}{tail}"));
         self.popup.clear();
     }

@@ -4,7 +4,7 @@
 use crate::cancel::Cancel;
 use crate::http::Fail;
 use crate::provider::{Delta, Kind, Mode, Provider, Reply};
-use crate::{anthropic, openai, sys, text};
+use crate::{anthropic, gemini, openai, sys, text};
 use serde_json::{Value, json};
 use std::io::Write;
 use std::path::PathBuf;
@@ -150,6 +150,7 @@ impl Provider {
         match self.kind {
             Kind::Anthropic => self.base == anthropic::BASE,
             Kind::OpenAi => self.base == openai::BASE,
+            Kind::Gemini => self.base == gemini::BASE,
             Kind::Ollama => false,
         }
     }

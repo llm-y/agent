@@ -22,6 +22,7 @@ fn once(
         let mut m = m.clone();
         if let Some(o) = m.as_object_mut() {
             o.shift_remove("blocks");
+            o.shift_remove("parts");
             o.shift_remove("reasoning");
             // Argumen yang bukan JSON sah (dari provider lain) ditolak Ollama.
             for c in o.get_mut("tool_calls").and_then(Value::as_array_mut).into_iter().flatten() {

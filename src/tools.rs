@@ -144,7 +144,14 @@ fn has_secret(p: &Path) -> bool {
     p.components().any(|c| secret(&c.as_os_str().to_string_lossy()))
 }
 
+fn is_secret_path(cwd: &Path, p: &Path) -> bool {
+    crate::api::file().as_deref() == Some(p) || p.strip_prefix(cwd).map_or(true, has_secret)
+}
+
 fn guarded(cwd: &Path, p: &Path) -> bool {
+    if crate::api::file().as_deref() == Some(p) {
+        return true;
+    }
     match p.strip_prefix(cwd) {
         Ok(r) if has_secret(r) => true,
         Ok(r) => r.components().any(|c| c.as_os_str().eq_ignore_ascii_case(".git")),
@@ -182,7 +189,7 @@ pub fn prepare(name: &str, a: &Value, cwd: &Path) -> Result<Prepared, String> {
             }
             Ok(Prepared {
                 title: format!("read {}", show(cwd, &path)),
-                guarded: path.strip_prefix(cwd).map_or(true, has_secret),
+                guarded: is_secret_path(cwd, &path),
                 memory: false,
                 action: Action::Read {
                     path,
@@ -203,7 +210,7 @@ pub fn prepare(name: &str, a: &Value, cwd: &Path) -> Result<Prepared, String> {
             let wher = show(cwd, &path);
             Ok(Prepared {
                 title: format!("grep {what}{}", if wher == "." { String::new() } else { format!("  {wher}") }),
-                guarded: path.strip_prefix(cwd).map_or(true, has_secret),
+                guarded: is_secret_path(cwd, &path),
                 memory: false,
                 action: Action::Grep { path, query: grep::Query::new(&pattern, &glob, icase)? },
             })
@@ -566,7 +573,7 @@ fn bash(cmd: &str, timeout: u64, cwd: &Path, max: usize, cancel: &Cancel) -> Res
         .stdout(wr.try_clone().map_err(io)?).stderr(wr)
         .env("PAGER", "cat").env("GIT_PAGER", "cat").env("GIT_TERMINAL_PROMPT", "0").env("TERM", "dumb");
     // Kunci API milik llmy tidak perlu terlihat oleh perintah yang ditulis model.
-    for k in ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY"] {
+    for k in ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"] {
         c.env_remove(k);
     }
     let mut child = c.spawn().map_err(io)?;

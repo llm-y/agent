@@ -1,8 +1,10 @@
 //! Loop agent: model -> tool -> model, sampai model berhenti memanggil tool.
 
+use crate::api;
 use crate::cancel::Cancel;
+use crate::gemini;
 use crate::perm::{Answer, Perm};
-use crate::anthropic::strip_thinking;
+use crate::anthropic;
 use crate::provider::{Delta, Mode, Provider};
 use crate::memory;
 use crate::rules;
@@ -42,6 +44,7 @@ pub enum Cmd {
     Clear,
     Compact,
     Model(Option<String>),
+    Api(String),
     Think,
     Memory,
     /// Simpan langsung tanpa lewat model.
@@ -206,6 +209,7 @@ impl Agent {
                 Cmd::Memory => self.send(Ev::Info(memory::show(&self.cwd))),
                 Cmd::Remember(s) => self.remember(&s),
                 Cmd::Model(want) => self.model(want),
+                Cmd::Api(arg) => self.api(&arg),
             }
             self.status();
             self.send(Ev::Done);
@@ -246,10 +250,26 @@ impl Agent {
             Err(e) => return self.send(Ev::Error(e)),
         };
         match next {
-            None => self.send(Ev::Info(format!(
-                "Model tersedia di {} (ganti: /model <nama>, /model anthropic/<nama>, /model openai/<nama>):\n{}",
-                self.provider.base, list.join("\n")
-            ))),
+            None => {
+                let mut msg = format!(
+                    "Model tersedia di {} (ganti: /model <nama>, /model anthropic/<nama>, /model openai/<nama>, /model gemini/<nama>, /model <profil>/<nama>):\n{}",
+                    self.provider.base,
+                    list.join("\n")
+                );
+                let cfg = api::Config::load();
+                let mut profs: Vec<String> = cfg
+                    .providers
+                    .keys()
+                    .chain(self.provider.session_apis.keys())
+                    .cloned()
+                    .collect();
+                profs.sort();
+                profs.dedup();
+                if !profs.is_empty() {
+                    msg.push_str(&format!("\n\nProfil API (/api use <nama>): {}", profs.join(", ")));
+                }
+                self.send(Ev::Info(msg));
+            }
             Some(p) if list.contains(&p.model) => {
                 self.provider = p;
                 (self.used, self.counted) = (0, 0);
@@ -257,6 +277,169 @@ impl Agent {
                 self.warn_remote();
             }
             Some(p) => self.send(Ev::Error(format!("Model {} tidak ada. Tersedia: {}", p.model, list.join(", ")))),
+        }
+    }
+
+    fn switch_provider(&mut self, mut p: Provider) {
+        (p.think, p.effort) = (self.provider.think, self.provider.effort.clone());
+        p.set_tools(self.provider.tools);
+        self.provider = p;
+        (self.used, self.counted) = (0, 0);
+        self.send(Ev::Info(format!("Provider sekarang {} ({}).", self.provider.label(), self.provider.base)));
+        self.warn_remote();
+    }
+
+    fn api(&mut self, raw: &str) {
+        let words = match api::split_words(raw) {
+            Ok(w) => w,
+            Err(e) => return self.send(Ev::Error(e)),
+        };
+        let sub = words.first().map(String::as_str).unwrap_or("list");
+        match sub {
+            "list" | "ls" => {
+                let cfg = api::Config::load();
+                let mut msg = format!(
+                    "Aktif: {} ({} · {} · kunci {})\n\n{}",
+                    self.provider.label(),
+                    api::kind_name(self.provider.kind),
+                    self.provider.base,
+                    self.provider.masked_key(),
+                    api::format_list(&cfg, &self.provider.session_apis, Some(&self.provider.profile))
+                );
+                msg.push_str(
+                    "\nPerintah:\n  /api set <nama> [--protocol p] [--url u] [--key k] [--model m] [--default] [--session]\n  /api session <nama> [--protocol p] [--url u] [--key k] [--model m]\n  /api use <nama> [model]\n  /api default <nama> [model]\n  /api remove <nama>",
+                );
+                self.send(Ev::Info(msg));
+            }
+            "set" | "session" => {
+                let Some(name) = words.get(1) else {
+                    return self.send(Ev::Error(format!("Pakai: /api {sub} <nama> [--protocol p] [--url u] [--key k] [--model m]")));
+                };
+                let opts = match api::parse_set_opts(&words[2..]) {
+                    Ok(o) => o,
+                    Err(e) => return self.send(Ev::Error(e)),
+                };
+                let session_only = sub == "session" || opts.session;
+                let set_default = opts.default;
+                let cfg = match api::Config::load_strict() {
+                    Ok(c) => c,
+                    Err(e) => return self.send(Ev::Error(e)),
+                };
+                let existing = if session_only {
+                    self.provider.session_apis.get(name).or_else(|| cfg.providers.get(name)).cloned()
+                } else {
+                    cfg.providers.get(name).cloned()
+                };
+                let prof = match api::build_profile(name, existing.as_ref(), opts) {
+                    Ok(p) => p,
+                    Err(e) => return self.send(Ev::Error(e)),
+                };
+                let proto = api::kind_name(prof.protocol);
+                let url = prof.url.clone().unwrap_or_else(|| api::default_url(prof.protocol).into());
+                if session_only {
+                    if set_default {
+                        return self.send(Ev::Error("--default tidak bisa digabung dengan mode sesi".into()));
+                    }
+                    let model_hint = prof.model.clone();
+                    self.provider.session_apis.insert(name.clone(), prof);
+                    self.send(Ev::Info(format!("API '{name}' diatur untuk sesi ini saja ({proto} · {url}).")));
+                    if name == &self.provider.profile {
+                        let spec = format!("{name}/{}", self.provider.model);
+                        match Provider::with_options(&spec, None, None, None, self.provider.session_apis.clone()) {
+                            Ok(p) => self.switch_provider(p),
+                            Err(e) => self.send(Ev::Error(e)),
+                        }
+                    } else if let Some(m) = model_hint {
+                        let spec = format!("{name}/{m}");
+                        match Provider::with_options(&spec, None, None, None, self.provider.session_apis.clone()) {
+                            Ok(p) => self.switch_provider(p),
+                            Err(e) => self.send(Ev::Error(e)),
+                        }
+                    }
+                } else {
+                    let mut cfg = cfg;
+                    cfg.providers.insert(name.clone(), prof);
+                    if set_default {
+                        cfg.default = Some(name.clone());
+                    }
+                    if let Err(e) = cfg.save() {
+                        return self.send(Ev::Error(e));
+                    }
+                    let def = if set_default { " [bawaan]" } else { "" };
+                    self.send(Ev::Info(format!("Provider '{name}' disimpan ({proto} · {url}){def}.")));
+                    if name == &self.provider.profile {
+                        let spec = format!("{name}/{}", self.provider.model);
+                        if let Ok(p) = Provider::with_options(&spec, None, None, None, self.provider.session_apis.clone()) {
+                            self.switch_provider(p);
+                        }
+                    }
+                }
+            }
+            "use" => {
+                let Some(name) = words.get(1) else {
+                    return self.send(Ev::Error("Pakai: /api use <nama> [model]".into()));
+                };
+                let spec = match words.get(2) {
+                    Some(m) => format!("{name}/{m}"),
+                    None if name == "ollama" => "ollama/qwen3.5:9b".into(),
+                    None => name.clone(),
+                };
+                match Provider::with_options(&spec, None, None, None, self.provider.session_apis.clone()) {
+                    Ok(p) => self.switch_provider(p),
+                    Err(e) => self.send(Ev::Error(e)),
+                }
+            }
+            "default" => {
+                let Some(name) = words.get(1) else {
+                    return self.send(Ev::Error("Pakai: /api default <nama> [model]".into()));
+                };
+                let mut cfg = match api::Config::load_strict() {
+                    Ok(c) => c,
+                    Err(e) => return self.send(Ev::Error(e)),
+                };
+                let model = words.get(2).cloned();
+                if let Some(p) = cfg.providers.get_mut(name) {
+                    if let Some(m) = model {
+                        p.model = Some(m);
+                    }
+                } else if let Some((proto, url)) = api::preset(name) {
+                    cfg.providers.insert(name.clone(), api::Profile {
+                        protocol: proto,
+                        url: Some(url.into()),
+                        key: None,
+                        model,
+                    });
+                } else {
+                    return self.send(Ev::Error(format!("Provider '{name}' belum ada; simpan dulu dengan /api set {name} ...")));
+                }
+                cfg.default = Some(name.clone());
+                if let Err(e) = cfg.save() {
+                    return self.send(Ev::Error(e));
+                }
+                self.send(Ev::Info(format!("Provider bawaan sekarang '{name}'.")));
+            }
+            "remove" | "rm" | "delete" => {
+                let Some(name) = words.get(1) else {
+                    return self.send(Ev::Error("Pakai: /api remove <nama>".into()));
+                };
+                let removed_sess = self.provider.session_apis.remove(name).is_some();
+                let mut cfg = match api::Config::load_strict() {
+                    Ok(c) => c,
+                    Err(e) => return self.send(Ev::Error(e)),
+                };
+                let removed_disk = cfg.providers.remove(name).is_some();
+                if !removed_sess && !removed_disk {
+                    return self.send(Ev::Error(format!("Provider '{name}' tidak ada.")));
+                }
+                if cfg.default.as_deref() == Some(name.as_str()) {
+                    cfg.default = None;
+                }
+                if removed_disk && let Err(e) = cfg.save() {
+                    return self.send(Ev::Error(e));
+                }
+                self.send(Ev::Info(format!("Provider '{name}' dihapus.")));
+            }
+            _ => self.send(Ev::Error(format!("Subperintah /api tidak dikenal: {sub}. Ketik /api untuk daftar perintah."))),
         }
     }
 
@@ -336,6 +519,9 @@ impl Agent {
             }
             if let Some(b) = r.blocks {
                 m["blocks"] = b;
+            }
+            if let Some(p) = r.parts {
+                m["parts"] = p;
             }
             self.push(m);
             self.counted = self.msgs.len();
@@ -554,11 +740,16 @@ const SUMMARY: &str = "[Summary of the conversation so far]";
 /// Perkiraan ukuran skema tool yang ikut dikirim.
 const SCHEMA_BYTES: usize = 3_300;
 
-/// Ukuran pesan tanpa salinan `blocks` (isinya sama dengan content dan tool_calls) dan
+/// Ukuran pesan tanpa salinan `blocks`/`parts` (isinya sama dengan content dan tool_calls) dan
 /// `reasoning` (umumnya tidak dikirim).
 fn size(m: &Value) -> usize {
     let skip = |k: &str| m.get(k).map_or(0, |b| b.to_string().len() + k.len() + 4);
-    m.to_string().len() - skip("blocks") - skip("reasoning")
+    m.to_string().len() - skip("blocks") - skip("parts") - skip("reasoning")
+}
+
+fn strip_thinking(msgs: &mut [Value]) {
+    anthropic::strip_thinking(msgs);
+    gemini::strip_thinking(msgs);
 }
 
 fn bytes(m: &[Value]) -> usize {
