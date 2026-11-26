@@ -106,6 +106,7 @@ pub struct Agent {
     touched: std::collections::BTreeSet<PathBuf>,
     /// Sub-agent baca-saja: hanya read/grep/head/tail.
     readonly: bool,
+    pub gate_mode: GateMode,
     /// Metrik giliran yang sedang berjalan.
     pub(crate) stat: crate::metrics::Turn,
     /// Peta proyek di pesan pertama dan catatan state (`LLMY_MAP=on`). Bawaan mati: ablasi E09 tidak
@@ -118,6 +119,20 @@ enum GateEnd {
     Skip,
     Fail(String),
 }
+
+/// Mode gerbang akhir giliran (`LLMY_GATE`), untuk eksperimen kontrol: `on` (bawaan) uji + keluaran +
+/// potongan kode; `off` tanpa gerbang; `nudge` plasebo anggaran: satu giliran tambahan dengan pesan umum,
+/// tanpa uji; `blind` uji dijalankan, bila gagal hanya "uji gagal" tanpa keluaran.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum GateMode {
+    On,
+    Off,
+    Nudge,
+    Blind,
+}
+
+const NUDGE: &str = "[llmy: before you finish, re-check that your changes fully satisfy the request and that nothing is broken. If everything is correct, reply that you are done.]";
+const BLIND: &str = "[llmy ran the project's tests after your changes and they FAIL. Fix the code, not the tests (unless the user asked to change tests), then finish.]";
 
 /// Giliran yang bisa dibatalkan dengan `/undo`.
 const UNDO_MAX: usize = 20;
@@ -196,7 +211,13 @@ impl Agent {
             checks: vec![], verify_ok: false, vmem: verify::Memory::default(),
             flow: Flow::Loop, planner: None, fallback: vec![], snap: None, sub: false,
             subagent: None, turn_log: BTreeMap::new(), undo: vec![], note: None, tree: None, gates: vec![], gate_ok: None,
-            touched: Default::default(), stat: Default::default(), readonly: false, map: crate::provider::env("LLMY_MAP").is_some_and(|v| v == "on"),
+            touched: Default::default(), stat: Default::default(), readonly: false,
+            gate_mode: match crate::provider::env("LLMY_GATE").as_deref() {
+                Some("off") => GateMode::Off,
+                Some("nudge") => GateMode::Nudge,
+                Some("blind") => GateMode::Blind,
+                _ => GateMode::On,
+            }, map: crate::provider::env("LLMY_MAP").is_some_and(|v| v == "on"),
         };
         // JSON skema + pembungkus per provider (perkiraan).
         a.schema_bytes = a.tools.to_string().len() * 11 / 10;
@@ -689,7 +710,15 @@ impl Agent {
             }
             if r.calls.is_empty() {
                 // Model menyatakan selesai: uji proyek dulu.
-                if !self.sub && !self.cancel.is_set() {
+                if !self.sub && !self.cancel.is_set() && self.gate_mode == GateMode::Nudge && gate_left == 2 && !self.turn_log.is_empty() {
+                    // Plasebo: giliran tambahan tanpa informasi uji, sekali per giliran.
+                    gate_left = 0;
+                    self.stat.gate_fail += 1;
+                    self.send(Ev::Info("llmy: minta model memeriksa ulang (plasebo, LLMY_GATE=nudge)".into()));
+                    self.push(json!({"role":"user","content":NUDGE}));
+                    continue;
+                }
+                if !self.sub && !self.cancel.is_set() && matches!(self.gate_mode, GateMode::On | GateMode::Blind) {
                     match self.gate() {
                         GateEnd::Fail(fb) if gate_left > 0 => {
                             gate_left -= 1;
@@ -1272,7 +1301,10 @@ impl Agent {
                 code += &format!("\n{s}");
             }
         }
-        GateEnd::Fail(format!("[llmy ran the project's tests after your changes and they FAIL. Fix the code, not the tests (unless the user asked to change tests), then finish.]\n{all}{code}"))
+        if self.gate_mode == GateMode::Blind {
+            return GateEnd::Fail(BLIND.into());
+        }
+        GateEnd::Fail(format!("{BLIND}\n{all}{code}"))
     }
 
     /// Jalankan pemeriksaan untuk file yang diubah di langkah ini. Hasilnya untuk model,

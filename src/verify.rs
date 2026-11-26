@@ -282,7 +282,10 @@ pub fn gates(cwd: &Path, custom: Option<&str>) -> Vec<Gate> {
         let pytest = files.iter().any(|f| f.ends_with("conftest.py") || f.ends_with("pytest.ini"))
             || std::fs::read_to_string(cwd.join("pyproject.toml")).is_ok_and(|t| t.contains("[tool.pytest"));
         let py = if cfg!(windows) { "python" } else { "python3" };
-        let cmd = if pytest { format!("{py} -m pytest -q -x 2>&1") } else { format!("{py} -m unittest -q 2>&1") };
+        // pytest bila terpasang (juga menemukan `*_test.py`); unittest bawaan hanya mencari `test*.py`.
+        let has_pytest = pytest || std::process::Command::new(py).args(["-c", "import pytest"]).stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success());
+        let cmd = if has_pytest { format!("{py} -m pytest -q -x 2>&1") } else { format!("{py} -m unittest discover -q -p '*test*.py' 2>&1") };
         v.push(g(&cmd, cwd.to_path_buf(), vec!["py"]));
     }
     let js = vec!["js", "mjs", "cjs", "ts", "tsx"];
@@ -606,9 +609,9 @@ mod tests {
         fs::write(sub.join("app.js"), "").unwrap();
         let g = gates(&sub, None);
         let cmds: Vec<&str> = g.iter().map(|x| x.cmd.as_str()).collect();
-        assert!(cmds.contains(&"python3 -m unittest -q 2>&1") || cfg!(windows), "{cmds:?}");
+        assert!(cmds.iter().any(|c| c.contains("pytest") || c.contains("unittest discover")) || cfg!(windows), "{cmds:?}");
         assert!(cmds.contains(&"node --test 2>&1"), "{cmds:?}");
-        let py = g.iter().find(|x| x.cmd.contains("unittest")).unwrap();
+        let py = g.iter().find(|x| x.cmd.contains("unittest") || x.cmd.contains("pytest")).unwrap();
         assert!(py.command(&[sub.join("a.py")]).is_some() && py.command(&[sub.join("x.md")]).is_none() && !py.safe);
         fs::write(sub.join("conftest.py"), "").unwrap();
         assert!(gates(&sub, None).iter().any(|x| x.cmd.contains("pytest")));
