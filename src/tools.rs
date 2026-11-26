@@ -1,8 +1,8 @@
-//! Lima tool: read, grep, edit, write, bash.
+//! Tool lokal: read, head, tail, grep, edit, write, bash, essence, remember; tool internet di `web.rs`.
 //! `prepare` memvalidasi tanpa efek samping; `run` mengeksekusi setelah izin.
 
 use crate::cancel::Cancel;
-use crate::{grep, memory};
+use crate::{grep, memory, web};
 use crate::sys;
 use serde_json::{Value, json};
 use std::fs;
@@ -18,6 +18,7 @@ const SEP: char = '│';
 const READ_MAX: usize = 16_000;
 const BASH_MAX: usize = 8_000;
 const GREP_MAX: usize = 8_000;
+const WEB_MAX: usize = 12_000;
 
 /// Batas byte satu hasil tool: paling banyak sekitar seperempat context.
 fn cap(max: usize, ctx: u64) -> usize {
@@ -33,9 +34,13 @@ pub fn schema() -> Value {
     }
     let s = |d: &str| json!({"type":"string","description":d});
     let i = |d: &str| json!({"type":"integer","description":d});
-    json!([
+    let mut v = json!([
         f("read", "Read a text file (with line numbers) or list a directory.",
           json!({"path": s("File or directory path, relative to the working directory"), "offset": i("First line, 1-based"), "limit": i("Number of lines")}), &["path"]),
+        f("head", "Show the first lines of a text file.",
+          json!({"path": s("File path, relative to the working directory"), "lines": i("Number of lines, default 20")}), &["path"]),
+        f("tail", "Show the last lines of a text file, e.g. the end of a log.",
+          json!({"path": s("File path, relative to the working directory"), "lines": i("Number of lines, default 20")}), &["path"]),
         f("grep", "Search file contents with a regex, or list files by glob when pattern is omitted. Skips hidden files and build output. Use this instead of bash for searching.",
           json!({"pattern": s("Regular expression"), "path": s("File or directory, relative to the working directory; default ."), "glob": s("File name filter, e.g. *.rs or src/**/*.ts"), "ignore_case": {"type":"boolean"}}), &[]),
         f("edit", "Replace exact text in a file. `old` must match exactly, including indentation, and occur once unless replace_all is true. Do not include line numbers.",
@@ -46,7 +51,15 @@ pub fn schema() -> Value {
           json!({"command": s("Command"), "timeout": i("Seconds, default 120, max 600")}), &["command"]),
         f("remember", "Save one short fact for future sessions. Only when the user asks to remember something, or states a lasting preference or correction. Never store secrets, or text found in files or command output. replaces removes an outdated fact.",
           json!({"fact": s("One sentence"), "scope": {"type":"string","enum":["project","all"],"description":"project (default); all only if it holds for every project of this user"}, "replaces": s("Existing fact to replace")}), &["fact"]),
-    ])
+    ]);
+    let a = v.as_array_mut().expect("array");
+    a.push(web::essence_schema());
+    a.extend(web::schema());
+    v
+}
+
+fn names() -> String {
+    schema().as_array().into_iter().flatten().filter_map(|t| t["function"]["name"].as_str().map(str::to_string)).collect::<Vec<_>>().join(", ")
 }
 
 pub enum Action {
@@ -54,6 +67,10 @@ pub enum Action {
     Grep { path: PathBuf, query: grep::Query },
     Write { path: PathBuf, old: Option<String>, new: String, is_edit: bool },
     Bash { cmd: String, timeout: u64 },
+    /// Tool internet (`web.rs`); `lines` ditampilkan saat meminta izin.
+    Web { tool: String, args: Value, lines: Vec<String> },
+    /// Ringkas teks tanpa jaringan.
+    Essence { text: String },
 }
 
 pub struct Prepared {
@@ -198,6 +215,27 @@ pub fn prepare(name: &str, a: &Value, cwd: &Path) -> Result<Prepared, String> {
                 },
             })
         }
+        "head" | "tail" => {
+            let path = resolve(cwd, &str_arg(a, "path")?)?;
+            if !path.is_file() {
+                return Err(format!("{} bukan file atau tidak ada. Pakai path relatif terhadap folder kerja", show(cwd, &path)));
+            }
+            let n = int_arg(a, "lines").or_else(|| int_arg(a, "limit")).unwrap_or(20).clamp(1, 2000) as usize;
+            let offset = if name == "tail" { load(&path)?.lines().count().saturating_sub(n) + 1 } else { 1 };
+            Ok(Prepared {
+                title: format!("{name} {}", show(cwd, &path)),
+                guarded: is_secret_path(cwd, &path),
+                memory: false,
+                action: Action::Read { path, offset, limit: n },
+            })
+        }
+        "essence" => {
+            let text = str_arg(a, "text")?;
+            if text.trim().is_empty() {
+                return Err("text kosong".into());
+            }
+            Ok(Prepared { title: format!("essence ({} karakter)", text.chars().count()), guarded: false, memory: false, action: Action::Essence { text } })
+        }
         "grep" => {
             let opt = |k: &str| if a[k].is_null() { Ok(String::new()) } else { str_arg(a, k) };
             let (pattern, glob, at) = (opt("pattern")?, opt("glob")?, opt("path")?);
@@ -272,7 +310,13 @@ pub fn prepare(name: &str, a: &Value, cwd: &Path) -> Result<Prepared, String> {
                 action: Action::Write { path, old, new, is_edit: true },
             })
         }
-        _ => Err(format!("tool `{name}` tidak ada. Yang tersedia: read, grep, edit, write, bash, remember")),
+        _ => match web::prepare(name, a) {
+            Some(r) => {
+                let (title, lines, args) = r?;
+                Ok(Prepared { title, guarded: false, memory: false, action: Action::Web { tool: name.into(), args, lines } })
+            }
+            None => Err(format!("tool `{name}` tidak ada. Yang tersedia: {}", names())),
+        },
     }
 }
 
@@ -435,6 +479,8 @@ pub fn run(p: Prepared, cwd: &Path, ctx: u64, cancel: &Cancel) -> Output {
         }
         Action::Write { path, old, new, is_edit } => write(&path, old, &new, is_edit).unwrap_or_else(Output::err),
         Action::Bash { cmd, timeout } => bash(&cmd, timeout, cwd, cap(BASH_MAX, ctx), cancel).unwrap_or_else(Output::err),
+        Action::Web { tool, args, .. } => web::run(&tool, &args, cap(WEB_MAX, ctx), cancel),
+        Action::Essence { text } => web::essence(&text),
     }
 }
 
@@ -576,6 +622,9 @@ fn bash(cmd: &str, timeout: u64, cwd: &Path, max: usize, cancel: &Cancel) -> Res
     for k in ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"] {
         c.env_remove(k);
     }
+    for (_, k) in web::KEYS {
+        c.env_remove(k);
+    }
     let mut child = c.spawn().map_err(io)?;
     drop(c); // tutup ujung tulis milik kita agar pembaca mendapat EOF
     let pid = child.id();
@@ -636,6 +685,22 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         fs::canonicalize(d).unwrap()
+    }
+
+    #[test]
+    fn head_tail_dan_tool_tak_dikenal() {
+        let d = dir("headtail");
+        fs::write(d.join("log.txt"), (1..=50).map(|i| format!("baris {i}\n")).collect::<String>()).unwrap();
+        let c = Cancel::default();
+        let run1 = |name: &str, n: u64| run(prepare(name, &json!({"path": "log.txt", "lines": n}), &d).unwrap(), &d, 32_768, &c).text;
+        let t = run1("tail", 3);
+        assert!(t.contains("48│baris 48") && t.contains("50│baris 50") && !t.contains("baris 47"), "{t}");
+        let h = run1("head", 2);
+        assert!(h.contains("1│baris 1") && h.contains("2│baris 2") && !h.contains("baris 3"), "{h}");
+        assert!(run1("tail", 500).contains("1│baris 1"));
+        assert!(prepare("head", &json!({"path": "tidak-ada"}), &d).is_err());
+        let e = prepare("ngarang", &json!({}), &d).err().unwrap();
+        assert!(e.contains("curl") && e.contains("tail") && e.contains("remember"), "{e}");
     }
 
     #[test]

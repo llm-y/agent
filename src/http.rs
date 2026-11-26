@@ -15,7 +15,7 @@ pub struct Req<'a> {
     pub base: &'a str,
     pub method: &'a str,
     pub path: &'a str,
-    pub headers: &'a [(&'static str, String)],
+    pub headers: &'a [(&'a str, String)],
     pub body: &'a str,
 }
 
@@ -27,11 +27,13 @@ pub struct Fail {
     pub retry_after: Option<u64>,
     /// Server meminta agar tidak diulang.
     pub no_retry: bool,
+    /// Tujuan pengalihan (3xx); tidak diikuti di sini.
+    pub location: Option<String>,
 }
 
 impl From<String> for Fail {
     fn from(msg: String) -> Self {
-        Fail { status: 0, msg, retry_after: None, no_retry: false }
+        Fail { status: 0, msg, retry_after: None, no_retry: false, location: None }
     }
 }
 
@@ -207,10 +209,16 @@ fn exchange(
         Box::new(sock)
     };
     let mut head = format!(
-        "{} {}{} HTTP/1.1\r\nHost: {}\r\nUser-Agent: llmy\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+        "{} {}{} HTTP/1.1\r\nHost: {}\r\nUser-Agent: llmy\r\nContent-Length: {}\r\nConnection: close\r\n",
         req.method, t.prefix, req.path, t.host, req.body.len()
     );
+    if !req.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type")) {
+        head += "Content-Type: application/json\r\n";
+    }
     for (k, v) in req.headers {
+        if k.is_empty() || k.contains(|c: char| !c.is_ascii_graphic() || c == ':') {
+            return Err(format!("nama header {k:?} tidak sah").into());
+        }
         if v.contains(|c: char| c.is_control() || !c.is_ascii()) {
             return Err(format!("nilai header {k} mengandung karakter tidak sah").into());
         }
@@ -241,7 +249,7 @@ fn read_response<R: BufRead>(
         .and_then(|s| s.parse().ok())
         .ok_or("balasan HTTP tidak valid".to_string())?;
     let (mut chunked, mut len) = (false, u64::MAX);
-    let (mut retry_after, mut no_retry) = (None, false);
+    let (mut retry_after, mut no_retry, mut location) = (None, false, None);
     for _ in 0..200 {
         line.clear();
         (&mut r).take(16384).read_line(&mut line).map_err(io)?;
@@ -255,6 +263,7 @@ fn read_response<R: BufRead>(
                 "retry-after" => retry_after = v.trim().parse().ok(),
                 "x-should-retry" => no_retry = v.trim() == "false",
                 "content-length" => len = v.trim().parse().unwrap_or(u64::MAX),
+                "location" => location = Some(v.trim().to_string()),
                 _ => {}
             }
         }
@@ -269,7 +278,7 @@ fn read_response<R: BufRead>(
         let mut b = Vec::new();
         let _ = body.take(64 << 10).read_to_end(&mut b);
         let msg = format!("HTTP {status}: {}", error_text(&String::from_utf8_lossy(&b)));
-        return Err(Fail { status, msg, retry_after, no_retry });
+        return Err(Fail { status, msg, retry_after, no_retry, location });
     }
     let mut buf = Vec::new();
     loop {

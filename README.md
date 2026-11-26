@@ -7,6 +7,11 @@ Simpan dan pilih API dari beberapa provider lewat `llmy api set` (disimpan di `~
 hanya terbaca pemilik) atau `/api` di dalam sesi. Memori cukup di `AGENTS.md`: bagian `## Memory`
 milik proyek, atau `~/.config/llmy/AGENTS.md` yang terbawa ke semua proyek. Tanpa database.
 
+Tool: `read`, `head`, `tail`, `grep`, `edit`, `write`, `bash`, `essence`, `remember`, dan tool internet
+`curl`, `github`, `openalex`, `doi`, `spider`; `tavily`, `exa`, `linkup`, `firecrawl`, `scopus`, dan
+`brightdata` muncul bila kuncinya ada di env. Setiap tindakan ditanya, kecuali dengan `--allow` atau
+mode auto (`--auto`, `/auto`, Shift+Tab).
+
 Instalasi dan manual: <https://ll.my.id>
 
 ```sh

@@ -18,6 +18,7 @@ mod sys;
 mod text;
 mod tools;
 mod ui;
+mod web;
 
 use agent::{Agent, Cmd, Ev};
 use cancel::Cancel;
@@ -62,7 +63,10 @@ Opsi:
   -r, --resume <id>    lanjutkan sesi tertentu
       --sessions       daftar sesi di folder ini
       --no-session     jangan simpan sesi
-      --allow <daftar> tanpa tanya: edit, bash, memory (pisahkan dengan koma)
+      --allow <daftar> tanpa tanya: edit, bash, memory, web, atau all (pisahkan dengan koma)
+      --auto           mode auto: setujui semua tanpa tanya (sama dengan --allow all), kecuali
+                       path di luar folder kerja, di .git, atau file rahasia. Interaktif:
+                       /auto atau Shift+Tab untuk menyalakan/mematikan
   -p, --print <prompt> sekali jalan
   -h, --help / -V, --version
 
@@ -70,6 +74,10 @@ Instruksi dibaca dari AGENTS.md (atau CLAUDE.md), akar git sampai folder kerja.
 Memori: bagian Memory di AGENTS.md proyek, atau ~/.config/llmy/AGENTS.md untuk semua proyek.
 API tersimpan di ~/.config/llmy/api.json (Windows: %APPDATA%\\llmy), hanya bisa dibaca pemiliknya.
 Sesi disimpan di ~/.local/state/llmy/sessions (Windows: %LOCALAPPDATA%\\llmy), hanya bisa dibaca pemiliknya.
+Tool internet (curl, github, openalex, doi, spider) selalu ada; tavily, exa, linkup, firecrawl,
+scopus, dan brightdata muncul bila kuncinya ada di env (TAVILY_API_KEY, EXA_API_KEY,
+LINKUP_API_KEY, FIRECRAWL_API_KEY, SCOPUS_API_KEY, BRIGHTDATA_API_KEY + BRIGHTDATA_ZONE).
+GITHUB_TOKEN opsional untuk github.
 edit berlaku hanya di dalam folder kerja. bash berjalan dengan hak akses Anda.";
 
 struct Opts {
@@ -131,12 +139,15 @@ fn parse() -> Result<(Opts, impl FnOnce() -> Result<Provider, String>), String> 
                 effort = Some(e);
             }
             "-p" | "--print" => o.prompt = Some(val()?),
+            "--auto" => o.perm.all.store(true, std::sync::atomic::Ordering::Relaxed),
             "--allow" => {
                 for s in val()?.split(',') {
                     match s {
                         "edit" => o.perm.allow_edit = true,
                         "bash" => o.perm.allow_bash = true,
                         "memory" => o.perm.allow_memory = true,
+                        "web" => o.perm.allow_web = true,
+                        "all" => o.perm.all.store(true, std::sync::atomic::Ordering::Relaxed),
                         _ => return Err(format!("--allow tidak mengenal `{s}`")),
                     }
                 }
@@ -185,13 +196,14 @@ fn main() {
             ui::restore();
         }
     });
+    let auto = o.perm.all.clone();
     let agent = Agent::new(provider, o.perm, interactive, cwd.clone(), cancel.clone(), tx.clone())
         .with_session(session, history);
     let (ctx, crx) = channel();
     std::thread::spawn(move || agent.serve(crx));
     match o.prompt {
         None => {
-            if let Err(e) = ui::run(cwd, cancel, tx, rx, ctx) {
+            if let Err(e) = ui::run(cwd, cancel, tx, rx, ctx, auto) {
                 die(&e.to_string());
             }
         }

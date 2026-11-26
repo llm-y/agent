@@ -11,6 +11,7 @@ use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthChar;
@@ -27,11 +28,12 @@ const SPIN: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'
 /// berjalan tidak ikut menyetujui.
 const ASK_GUARD: Duration = Duration::from_millis(500);
 
-const COMMANDS: [(&str, &str); 10] = [
+const COMMANDS: [(&str, &str); 11] = [
     ("/help", "bantuan"),
     ("/model", "lihat atau ganti model"),
     ("/api", "atur atau pilih API provider"),
     ("/think", "aktif/nonaktifkan thinking"),
+    ("/auto", "mode auto: setujui semua tanpa tanya (juga Shift+Tab)"),
     ("/compact", "ringkas percakapan untuk menghemat context"),
     ("/remember", "simpan fakta: /remember <fakta> atau /remember all <fakta>"),
     ("/memory", "lihat memori proyek dan semua proyek"),
@@ -241,6 +243,7 @@ struct Ui {
     cwd: PathBuf,
     cancel: Arc<Cancel>,
     cmd: Sender<Cmd>,
+    auto: Arc<AtomicBool>,
     quit: bool,
 }
 
@@ -251,7 +254,7 @@ pub fn restore() {
     let _ = io::stdout().flush();
 }
 
-pub fn run(cwd: PathBuf, cancel: Arc<Cancel>, tx: Sender<Ev>, rx: Receiver<Ev>, cmd: Sender<Cmd>) -> io::Result<()> {
+pub fn run(cwd: PathBuf, cancel: Arc<Cancel>, tx: Sender<Ev>, rx: Receiver<Ev>, cmd: Sender<Cmd>, auto: Arc<AtomicBool>) -> io::Result<()> {
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |i| {
         restore();
@@ -275,7 +278,7 @@ pub fn run(cwd: PathBuf, cancel: Arc<Cancel>, tx: Sender<Ev>, rx: Receiver<Ev>, 
         popup: vec![], popup_sel: 0, popup_off: false, files: None, exit_hint: None,
         partial: String::new(), in_text: false, in_code: false, answer: String::new(), last_answer: String::new(),
         thought: 0, tool: None, status: (0, 1, String::new(), false),
-        cwd, cancel: cancel.clone(), cmd, quit: false,
+        cwd, cancel: cancel.clone(), cmd, auto, quit: false,
     };
     ui.intro();
     let r = ui.main_loop(rx);
@@ -482,6 +485,9 @@ impl Ui {
         let k = |n: u64| if n < 1000 { n.to_string() } else { format!("{:.1}k", n as f64 / 1000.0) };
         let (t, c, m, th) = &self.status;
         let th = if *th { " · thinking" } else { "" };
+        if self.auto.load(Ordering::Relaxed) {
+            return Row::new(YELLOW, &sanitize(&format!("  {m}{th} · {}/{} · auto (Shift+Tab) · /help", k(*t), k(*c))), w);
+        }
         Row::new(DIM, &sanitize(&format!("  {m}{th} · {}/{} · /help", k(*t), k(*c))), w)
     }
 
@@ -626,10 +632,31 @@ impl Ui {
         let _ = self.cmd.send(c);
     }
 
+    /// Berlaku seketika, juga di tengah giliran: agent membaca saklar yang sama.
+    fn toggle_auto(&mut self) {
+        let on = !self.auto.load(Ordering::Relaxed);
+        self.auto.store(on, Ordering::Relaxed);
+        // Saat bekerja, footer saja yang berubah agar teks yang sedang mengalir tidak terpotong.
+        if !self.busy {
+            let m = if on {
+                "Mode auto aktif: semua disetujui tanpa tanya, kecuali path di luar folder kerja, di .git, atau file rahasia."
+            } else {
+                "Mode auto nonaktif: izin ditanya lagi."
+            };
+            self.lines(if on { YELLOW } else { DIM }, "  ", m);
+        }
+    }
+
     fn submit(&mut self, s: String) {
         let t = s.trim().to_string();
         if t.is_empty() {
             return;
+        }
+        if t == "/auto" {
+            if !self.busy {
+                self.lines(DIM, "› ", &t);
+            }
+            return self.toggle_auto();
         }
         if self.busy {
             return self.queue.push_back(t);
@@ -665,7 +692,7 @@ impl Ui {
                 for (k, d) in COMMANDS {
                     h += &format!("{k:<10} {d}\n");
                 }
-                h += "\n@        sebut file\nEnter    kirim (saat bekerja: antre)\nAlt+Enter, Ctrl+J, atau \\ lalu Enter: baris baru\nEsc      hentikan giliran\nCtrl-C   hentikan; dua kali untuk keluar";
+                h += "\n@        sebut file\nEnter    kirim (saat bekerja: antre)\nAlt+Enter, Ctrl+J, atau \\ lalu Enter: baris baru\nShift+Tab mode auto (setujui semua tanpa tanya)\nEsc      hentikan giliran\nCtrl-C   hentikan; dua kali untuk keluar";
                 self.lines(DIM, "  ", &h);
             }
             _ => self.lines(RED, "✗ ", &format!("Perintah {name} tidak ada. Lihat /help")),
@@ -762,6 +789,7 @@ impl Ui {
                 return;
             }
             KeyCode::Tab if popup => self.accept(),
+            KeyCode::BackTab => self.toggle_auto(),
             KeyCode::Enter if popup && !alt => {
                 let (pick, whole) = (self.popup[self.popup_sel].0.clone(), self.ed.text());
                 self.accept();

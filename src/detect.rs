@@ -216,7 +216,7 @@ mod tests {
 
     #[test]
     fn mengenali_penolakan_tools() {
-        let f = |status, msg: &str| Fail { status, msg: msg.into(), retry_after: None, no_retry: false };
+        let f = |status, msg: &str| Fail { status, msg: msg.into(), retry_after: None, no_retry: false, location: None };
         for (s, m) in [
             (400, "registry.ollama.ai/library/x:1b does not support tools"),
             (404, "No endpoints found that support tool use"),

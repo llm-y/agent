@@ -15,8 +15,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
-const MAX_STEPS: usize = 50;
 const MAX_REPEAT: usize = 3;
+/// Tanpa batas langkah, model yang macet dihentikan setelah sekian tool gagal berturut-turut.
+const MAX_FAILS: usize = 8;
 
 /// Baris tampilan: penanda (' ', '-', '+', '$'), nomor baris (0 = tanpa), teks.
 pub type Detail = Vec<(char, usize, String)>;
@@ -60,6 +61,8 @@ pub struct Agent {
     tx: Sender<Ev>,
     msgs: Vec<Value>,
     tools: Value,
+    /// Byte daftar tool, ikut terkirim di setiap permintaan.
+    schema_bytes: usize,
     /// Token nyata dari balasan terakhir, dan jumlah pesan yang sudah tercakup.
     used: u64,
     counted: usize,
@@ -101,9 +104,11 @@ fn system_prompt(cwd: &std::path::Path, rules: &str) -> String {
 impl Agent {
     pub fn new(provider: Provider, perm: Perm, interactive: bool, cwd: PathBuf, cancel: Arc<Cancel>, tx: Sender<Ev>) -> Self {
         let mut a = Agent {
-            provider, perm, interactive, cwd, cancel, tx, msgs: vec![], tools: tools::schema(),
+            provider, perm, interactive, cwd, cancel, tx, msgs: vec![], tools: tools::schema(), schema_bytes: 0,
             used: 0, counted: 0, ratio: 3.0, session: None,
         };
+        // JSON skema + pembungkus per provider (perkiraan).
+        a.schema_bytes = a.tools.to_string().len() * 11 / 10;
         a.system();
         a
     }
@@ -447,7 +452,10 @@ impl Agent {
         let wish = memory::wish(&text);
         self.push(json!({"role":"user","content":text}));
         let mut history: Vec<String> = vec![];
-        for _ in 0..MAX_STEPS {
+        let mut fails = 0;
+        // Tanpa batas langkah: giliran berakhir bila model berhenti memanggil tool, pengguna
+        // menekan Esc, izin ditolak, atau panggilan yang sama diulang.
+        loop {
             if self.cancel.is_set() {
                 return self.send(Ev::Info("Dihentikan.".into()));
             }
@@ -502,7 +510,7 @@ impl Agent {
                 self.send(Ev::Info(n.clone()));
             }
             if r.tokens > 0 {
-                let sent = bytes(&self.msgs) + SCHEMA_BYTES + r.content.len() + r.thinking.len() + r.reasoning.len();
+                let sent = bytes(&self.msgs) + self.schema_bytes + r.content.len() + r.thinking.len() + r.reasoning.len();
                 self.ratio = (sent as f64 / r.tokens as f64).clamp(1.2, 4.5);
             }
             self.used = r.tokens;
@@ -548,11 +556,15 @@ impl Agent {
                     stop = matches!(s, Step::Stop) || self.cancel.is_set();
                     o
                 };
+                fails = if out.ok { 0 } else { fails + 1 };
                 let mut m = json!({"role":"tool","tool_name":c["function"]["name"],"content":out.text});
                 if let Some(id) = c["id"].as_str() {
                     m["tool_call_id"] = json!(id);
                 }
                 self.push(m);
+            }
+            if fails >= MAX_FAILS && !stop {
+                return self.send(Ev::Error(format!("Berhenti: {fails} tool gagal berturut-turut. Ketik \"lanjutkan\" atau beri arahan lain.")));
             }
             if stop && !self.interactive {
                 return;
@@ -561,7 +573,6 @@ impl Agent {
                 return self.send(Ev::Info("Dihentikan. Beri arahan berikutnya.".into()));
             }
         }
-        self.send(Ev::Error(format!("Berhenti setelah {MAX_STEPS} langkah. Ketik \"lanjutkan\" untuk meneruskan.")));
     }
 
     fn call(&mut self, c: &Value, history: &mut Vec<String>) -> (Output, Step) {
@@ -624,8 +635,9 @@ impl Agent {
                 Answer::No => {
                     self.send(Ev::ToolDone { ok: false, summary: "ditolak".into() });
                     let need = match &p.action {
-                        Action::Bash { .. } => "jalankan ulang dengan --allow bash",
-                        Action::Write { .. } if !p.guarded => "jalankan ulang dengan --allow edit",
+                        Action::Bash { .. } => "jalankan ulang dengan --allow bash atau --auto",
+                        Action::Write { .. } if !p.guarded => "jalankan ulang dengan --allow edit atau --auto",
+                        Action::Web { .. } => "jalankan ulang dengan --allow web atau --auto",
                         _ => "path di luar folder kerja, di .git, atau file rahasia; pakai mode interaktif",
                     };
                     self.send(Ev::Error(format!("{} tidak diizinkan, tidak ada yang dikerjakan untuk langkah ini: {need}.", p.title)));
@@ -672,13 +684,13 @@ impl Agent {
         if self.used > 0 && self.counted <= self.msgs.len() {
             self.used as usize + tok(bytes(&self.msgs[self.counted..]))
         } else {
-            tok(bytes(&self.msgs) + SCHEMA_BYTES)
+            tok(bytes(&self.msgs) + self.schema_bytes)
         }
     }
 
     /// Byte riwayat yang setara dengan 80% context.
     fn budget(&self) -> usize {
-        ((self.provider.ctx as f64 * 0.8 * self.ratio) as usize).saturating_sub(SCHEMA_BYTES)
+        ((self.provider.ctx as f64 * 0.8 * self.ratio) as usize).saturating_sub(self.schema_bytes)
     }
 
     /// Jaga context di bawah 80%: Ollama memotong diam-diam bila lewat.
@@ -737,8 +749,6 @@ impl Agent {
 }
 
 const SUMMARY: &str = "[Summary of the conversation so far]";
-/// Perkiraan ukuran skema tool yang ikut dikirim.
-const SCHEMA_BYTES: usize = 3_300;
 
 /// Ukuran pesan tanpa salinan `blocks`/`parts` (isinya sama dengan content dan tool_calls) dan
 /// `reasoning` (umumnya tidak dikirim).
@@ -882,7 +892,8 @@ fn shrink_inner(msgs: &mut Vec<Value>, limit: usize) -> (usize, usize) {
 
 fn detail(p: &Prepared) -> Detail {
     match &p.action {
-        Action::Read { .. } | Action::Grep { .. } => vec![],
+        Action::Read { .. } | Action::Grep { .. } | Action::Essence { .. } => vec![],
+        Action::Web { lines, .. } => lines.iter().map(|l| (' ', 0, l.clone())).collect(),
         // Perintah selalu tampil utuh: pengguna menyetujui apa yang ia lihat.
         Action::Bash { cmd, .. } => cmd.lines().map(|l| ('$', 0, l.to_string())).collect(),
         Action::Write { old, new, .. } => {
