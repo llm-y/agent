@@ -894,6 +894,11 @@ fn detail(p: &Prepared) -> Detail {
             }
             d
         }
+        // Tool pencarian dan akses data: hasil ditampilkan tanpa perlu detail khusus
+        Action::Search { .. } | Action::Openalex { .. } | Action::Doi { .. } | Action::Scopus { .. } | Action::Github { .. } | Action::Firecrawl { .. } | Action::Brightdata { .. } | Action::Browserbase { .. } => vec![],
+        // File view: tampil preview baris
+        Action::Head { path, limit } => ("│".repeat((*limit).min(20)).chars().map(|_| ' ').collect::<String>().lines().map(|l| ('~', 0, format!("{}...", l))).collect()),
+        Action::Tail { path, limit } => ("│".repeat((*limit).min(20)).chars().map(|_| ' ').collect::<String>().lines().map(|l| ('~', 0, format!("{}...", l))).collect()),
     }
 }
 

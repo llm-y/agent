@@ -1,7 +1,7 @@
 [package]
 name = "llmy"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 rust-version = "1.91"
 description = "Agent AI CLI yang ringan"
 license = "GPL-3.0-only"
@@ -15,11 +15,13 @@ tls = ["dep:rustls", "dep:webpki-roots"]
 
 [dependencies]
 crossterm = { version = "0.29", default-features = false, features = ["events", "bracketed-paste"] }
+httpreq = "0.8"
 regex-lite = "0.1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 serde_json = { version = "1", features = ["preserve_order"] }
 unicode-width = { version = "0.2", default-features = false }
 webpki-roots = { version = "1", optional = true }
+url = "2.5"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

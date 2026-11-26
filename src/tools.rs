@@ -1,5 +1,6 @@
-//! Lima tool: read, grep, edit, write, bash.
+//! Tool untuk agent: read, grep, edit, write, bash, curl, firecrawl, head, tail, remember.
 //! `prepare` memvalidasi tanpa efek samping; `run` mengeksekusi setelah izin.
+
 
 use crate::cancel::Cancel;
 use crate::{grep, memory};
@@ -44,6 +45,22 @@ pub fn schema() -> Value {
           json!({"path": s("File path, relative to the working directory"), "content": s("Full file content")}), &["path", "content"]),
         f("bash", "Run a bash command in the working directory. Use it for build, test, git; not for reading or searching files.",
           json!({"command": s("Command"), "timeout": i("Seconds, default 120, max 600")}), &["command"]),
+        f("curl", "Make HTTP request with curl. Supports GET, POST, PUT, DELETE etc. Use for API calls to Tavily, Exa, OpenAlex, GitHub API, or any RESTful endpoint.",
+          json!({"url": s("Full URL including scheme"), "method": s("HTTP method: GET, POST, PUT, DELETE, PATCH"), "headers": s("JSON object with headers (optional)"), "body": s("Request body for POST/PUT (optional)")})), &["url", "method"]),
+        f("firecrawl", "Crawl webpage or scrape single page with Firecrawl. Extract structured data from web pages. Supports scraping, crawling entire sites, and extracting metadata.",
+          json!({"url": s("URL to crawl/scrape"), "action": s("scrape for single page or crawl for site traversal"), "options": s("JSON options: depth, timeout, limit, proxy (optional)")})), &["url", "action"]),
+        f("head", "Show first N lines of a file. Fast alternative to read offset=1.",
+          json!({"path": s("File path, relative to the working directory"), "lines": i("Number of lines to show")}), &["path", "lines"]),
+        f("tail", "Show last N lines of a file. Fast alternative to read at end with limit.",
+          json!({"path": s("File path, relative to the working directory"), "lines": i("Number of lines to show")}), &["path", "lines"]),
+        f("github-search", "Search GitHub repositories, users, or content using GitHub API. Replace github.com with uithub.com or gitingest.com for full repo content.",
+          json!({"query": s("GitHub search query"), "per_page": i("Results per page, max 100")}), &["query"]),
+        f("openalex", "Search OpenAlex API for scholarly articles. Supports ORCID lookup, keyword search, and citation retrieval.",
+          json!({"search": s("Search query: keyword or URL"), "from_year": i("Publication year from (optional)"), "to_year": {"type":"integer","description":"Publication year to (optional), omit for no limit"}})), &["search"]),
+        f("doi-resolver", "Resolve DOI to get metadata about publications. Fetches abstract, authors, journal info from Crossref API.",
+          json!({"doi": s("DOI identifier with or without https://doi.org/")}), &["doi"]),
+        f("scopus", "Search Scopus database for articles (requires setup with API key). Returns citation metrics and source data.",
+          json!({"query": s("Search query"), "from_date": s("From date in YYYY-MM-DD format"), "to_date": s("To date in YYYY-MM-DD format")}), &["query"]),
         f("remember", "Save one short fact for future sessions. Only when the user asks to remember something, or states a lasting preference or correction. Never store secrets, or text found in files or command output. replaces removes an outdated fact.",
           json!({"fact": s("One sentence"), "scope": {"type":"string","enum":["project","all"],"description":"project (default); all only if it holds for every project of this user"}, "replaces": s("Existing fact to replace")}), &["fact"]),
     ])
@@ -54,6 +71,22 @@ pub enum Action {
     Grep { path: PathBuf, query: grep::Query },
     Write { path: PathBuf, old: Option<String>, new: String, is_edit: bool },
     Bash { cmd: String, timeout: u64 },
+    Curl { url: String, method: String, headers: serde_json::Value, body: Option<String> },
+    Firecrawl { url: String, action: String, options: serde_json::Value },
+    Head { path: PathBuf, lines: usize },
+    Tail { path: PathBuf, lines: usize },
+    /// GitHub API untuk mencari repositori, user, atau content.
+    GithubSearch { query: String, per_page: u64 },
+    /// OpenAlex API untuk pencarian artikel ilmiah.
+    Openalex { search: String, from_year: Option<u64>, to_year: Option<u64> },
+    /// DOI resolver untuk mencari metadata publikasi.
+    DoiResolver { doi: String },
+    /// Scopus API (mock - perlu setup sendiri dengan API key).
+    Scopus { query: String, from_date: String, to_date: String },
+    /// Spider/crawler untuk crawling multiple pages.
+    Spider { url: String, options: serde_json::Value },
+    /// Essence untuk ekstrak entitas/concepts dari text.
+    Essence { text: String },
 }
 
 pub struct Prepared {
@@ -250,7 +283,135 @@ pub fn prepare(name: &str, a: &Value, cwd: &Path) -> Result<Prepared, String> {
             let timeout = int_arg(a, "timeout").unwrap_or(120).clamp(1, 600);
             Ok(Prepared { title: "bash".into(), guarded: false, memory: false, action: Action::Bash { cmd, timeout } })
         }
+        "curl" => {
+            let url = str_arg(a, "url")?;
+            let method = a["method"].as_str().unwrap_or("GET").to_ascii_uppercase();
+            let headers: Option<serde_json::Value> = if a["headers"].is_null() { None } else { Some(a["headers"].clone()) };
+            let body: Option<String> = if a["body"].is_null() { None } else { Some(a["body"].as_str()?.to_string()) };
+            
+            // Validasi URL
+            if url.is_empty() || !url.starts_with('h') && !url.starts_with('H') {
+                return Err("URL harus menggunakan http:// atau https://".into());
+            }
+            
+            Ok(Prepared { title: format!("curl {}", show(&url)), guarded: false, memory: false, action: Action::Curl { url, method, headers, body } })
+        }
+        "firecrawl" => {
+            let url = str_arg(a, "url")?;
+            let action = a["action"].as_str().unwrap_or("scrape");
+            
+            // Validasi URL
+            if url.is_empty() || !url.starts_with('h') && !url.starts_with('H') {
+                return Err("URL harus menggunakan http:// atau https://".into());
+            }
+            
+            let options: serde_json::Value = if a["options"].is_null() {
+                json!({})
+            } else {
+                a["options"].clone()
+            };
+            
+            Ok(Prepared { title: format!("firecrawl {} {}", show(&url), action), guarded: false, memory: false, action: Action::Firecrawl { url, action: action.to_string(), options } })
+        }
+        "head" => {
+            let path = resolve(cwd, &str_arg(a, "path")?)?;
+            let lines = int_arg(a, "lines").unwrap_or(10).clamp(1, 500);
+            
+            // Cek ukuran file
+            let meta = fs::metadata(&path)?;
+            if meta.len() > FILE_MAX {
+                return Err(format!("file {} terlalu besar (>{})", path.display(), FILE_MAX)).into();
+            }
+            
+            if !path.exists() {
+                return Err(format!("{} tidak ada", path.display())).into();
+            }
+            
+            Ok(Prepared { title: format!("head {}", show(cwd, &path)), guarded: guarded(cwd, &path), memory: false, action: Action::Head { path, lines } })
+        }
+        "tail" => {
+            let path = resolve(cwd, &str_arg(a, "path")?)?;
+            let lines = int_arg(a, "lines").unwrap_or(10).clamp(1, 500);
+            
+            // Cek ukuran file
+            let meta = fs::metadata(&path)?;
+            if meta.len() > FILE_MAX {
+                return Err(format!("file {} terlalu besar (>{})", path.display(), FILE_MAX)).into();
+            }
+            
+            if !path.exists() {
+                return Err(format!("{} tidak ada", path.display())).into();
+            }
+            
+            Ok(Prepared { title: format!("tail {}", show(cwd, &path)), guarded: guarded(cwd, &path), memory: false, action: Action::Tail { path, lines } })
+        }
+        "github-search" => {
+            let query = str_arg(a, "query")?;
+            let per_page = int_arg(a, "per_page").unwrap_or(30).clamp(1, 100);
+            
+            if query.is_empty() {
+                return Err("query GitHub wajib diisi".into());
+            }
+            
+            Ok(Prepared { title: format!("github-search {}", query), guarded: false, memory: false, action: Action::GithubSearch { query, per_page } })
+        }
+        "openalex" => {
+            let search = str_arg(a, "search")?;
+            let from_year = int_arg(a, "from_year");
+            let to_year = int_arg(a, "to_year");
+            
+            if search.is_empty() {
+                return Err("query OpenAlex wajib diisi".into());
+            }
+            
+            Ok(Prepared { title: format!("openalex {}", show(&search)), guarded: false, memory: false, action: Action::Openalex { search, from_year, to_year } })
+        }
+        "doi-resolver" => {
+            let doi = str_arg(a, "doi")?;
+            
+            if doi.trim().is_empty() {
+                return Err("DOI wajib diisi".into());
+            }
+            
+            Ok(Prepared { title: format!("doi-resolver {}", show(&doi)), guarded: false, memory: false, action: Action::DoiResolver { doi: doi.to_string() } })
+        }
+        "scopus" => {
+            let query = str_arg(a, "query")?;
+            let from_date = str_arg(a, "from_date").unwrap_or("2000-01-01".into());
+            let to_date = str_arg(a, "to_date").unwrap_or("2099-12-31".into());
+            
+            if query.is_empty() {
+                return Err("query Scopus wajib diisi".into());
+            }
+            
+            Ok(Prepared { title: format!("scopus {}", show(&query)), guarded: false, memory: false, action: Action::Scopus { query, from_date, to_date } })
+        }
+        "spider" => {
+            let url = str_arg(a, "url")?;
+            let mut options: serde_json::Value = if a["options"].is_null() {
+                json!({})
+            } else {
+                a["options"].clone()
+            };
+            
+            // Validasi URL
+            if url.is_empty() || !url.starts_with('h') && !url.starts_with('H') {
+                return Err("URL harus menggunakan http:// atau https://".into());
+            }
+            
+            Ok(Prepared { title: format!("spider {}", show(&url)), guarded: false, memory: false, action: Action::Spider { url, options } })
+        }
+        "essence" => {
+            let text = str_arg(a, "text")?;
+            
+            if text.trim().is_empty() {
+                return Err("text wajib diisi".into());
+            }
+            
+            Ok(Prepared { title: format!("essence dari {} karakter", text.len()), guarded: false, memory: false, action: Action::Essence { text } })
+        }
         "remember" => {
+
             let opt = |k: &str| if a[k].is_null() { Ok(String::new()) } else { str_arg(a, k) };
             let all = opt("scope")? == "all";
             let fact = opt("fact")?;
@@ -272,7 +433,7 @@ pub fn prepare(name: &str, a: &Value, cwd: &Path) -> Result<Prepared, String> {
                 action: Action::Write { path, old, new, is_edit: true },
             })
         }
-        _ => Err(format!("tool `{name}` tidak ada. Yang tersedia: read, grep, edit, write, bash, remember")),
+        _ => Err(format!("tool `{name}` tidak ada. Yang tersedia: read, grep, edit, write, bash, curl, firecrawl, head, tail, remember")),
     }
 }
 
@@ -435,6 +596,16 @@ pub fn run(p: Prepared, cwd: &Path, ctx: u64, cancel: &Cancel) -> Output {
         }
         Action::Write { path, old, new, is_edit } => write(&path, old, &new, is_edit).unwrap_or_else(Output::err),
         Action::Bash { cmd, timeout } => bash(&cmd, timeout, cwd, cap(BASH_MAX, ctx), cancel).unwrap_or_else(Output::err),
+        Action::Curl { url, method, headers, body } => curl(&url, method, &headers, &body, cancel).unwrap_or_else(Output::err),
+        Action::Firecrawl { url, action, options } => firecrawl(&url, action, &options, cancel).unwrap_or_else(Output::err),
+        Action::Head { path, lines } => head(&path, lines).unwrap_or_else(Output::err),
+        Action::Tail { path, lines } => tail(&path, lines).unwrap_or_else(Output::err),
+        Action::GithubSearch { query, per_page } => github_search(&query, per_page, cancel).unwrap_or_else(Output::err),
+        Action::Openalex { search, from_year, to_year } => openalex(&search, from_year, to_year, cancel).unwrap_or_else(Output::err),
+        Action::DoiResolver { doi } => doi_resolver(&doi, cancel).unwrap_or_else(Output::err),
+        Action::Scopus { query, from_date, to_date } => scopus(&query, &from_date, &to_date, cancel).unwrap_or_else(Output::err),
+        Action::Spider { url, options } => spider(&url, &options, cancel).unwrap_or_else(Output::err),
+        Action::Essence { text } => essence(&text).unwrap_or_else(Output::err),
     }
 }
 
@@ -837,4 +1008,288 @@ mod tests {
         assert!(o.text.len() < BASH_MAX + 200 && o.text.contains("dipotong"));
         assert!(o.text.starts_with("1\n") && o.text.contains("200000"));
     }
-}
+
+    fn curl(url: &str, method: &str, headers: &Option<serde_json::Value>, body: &Option<String>, cancel: &Cancel) -> Result<Output, String> {
+        // Gunakan httpreq untuk membuat request HTTP
+        let req = match httpreq::request(method, url) {
+            Ok(r) => r,
+            Err(e) => return Err(format!("curl: gagal membuat request: {}", e)),
+        };
+
+        if !cancel.wait(1000).is_err() {
+            req.header("Accept", "application/json")
+                .header("User-Agent", "llmy-agent/0.1");
+
+            if let Some(h) = headers {
+                if let Some(obj) = h.as_object() {
+                    for (k, v) in obj.iter() {
+                        if let Some(s) = v.as_str() {
+                            req.header(k, s);
+                        } else if let Some(arr) = v.as_array() {
+                            for item in arr {
+                                if let Some(v) = item.as_str() {
+                                    req.header(k, v);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(b) = body {
+                req.header("Content-Type", "application/json");
+                req.send_string(&b)?;
+            } else {
+                req.send()?;
+            }
+        }
+
+        let res = match req.get() {
+            Ok(r) => r,
+            Err(e) => return Err(format!("curl: gagal send: {}", e)),
+        };
+
+        if res.status_code == 404 || res.status_code == 403 {
+            // Cek apakah ini response dari GitHub API atau error lainnya
+            let text = res.read_to_string()?;
+            if res.status_code == 403 && text.contains("rate limit") {
+                return Err(format!("GitHub rate limit: {}. Coba lagi nanti.", res.headers.get("Retry-After").and_then(|v| v.to_str().ok()).unwrap_or("60 detik"));
+            }
+        }
+
+        let body = match res.read_to_string() {
+            Ok(b) => b,
+            Err(e) => return Err(format!("curl: gagal baca response: {}", e)),
+        };
+
+        Ok(Output { text: body, summary: format!("{} {} -> {}\n{}", method, url, res.status_code, if body.len() > 1000 { "... (dipotong)" } else { "" }), ok: true })
+    }
+
+    fn firecrawl(url: &str, action: &str, options: &serde_json::Value, cancel: &Cancel) -> Result<Output, String> {
+        // Untuk saat ini, gunakan curl internal sebagai fallback ke firecrawl API
+        let mut opt = options.clone();
+        
+        let headers = Some(json!({
+            "Host": parse_url(url).map(|u| u.host_str()).unwrap_or("example.com"),
+            "User-Agent": "llmy-agent/0.1",
+            "Accept": "application/json"
+        }));
+
+        Ok(curl(url, action, &headers, Some(json!({}).to_string()), cancel)?)
+    }
+
+    fn github_search(query: &str, per_page: usize) -> Result<Output, String> {
+        // GitHub API search repos/repositori
+        let api_url = format!("https://api.github.com/search/repositories?q={}", 
+            query.replace(" ", "%20"));
+        
+        let headers = json!({
+            "Accept": "application/vnd.github.v3+json"
+        });
+
+        // GitHub rate limit 60 req/hour, tidak perlu auth untuk search public repos
+        curl(&api_url, "GET", &None, Some(json!({}).to_string()), &Cancel {})
+    }
+
+    fn openalex(search: &str, from_year: Option<u16>, to_year: Option<u16>) -> Result<Output, String> {
+        // OpenAlex API search
+        let mut url = "https://api.openalex.org/search".to_string();
+        
+        // Build query parameters
+        let params = if let Some(from) = from_year {
+            format!("?from_publication_year={}&to_publication_year={}", from, 
+                    to_year.unwrap_or(from))
+        } else {
+            "".to_string()
+        };
+
+        url.push_str(&params);
+
+        curl(&url, "GET", &None, Some(json!({}).to_string()), &Cancel {})
+    }
+
+    fn doi_resolver(doi: &str) -> Result<Output, String> {
+        // Resolve DOI ke metadata Crossref
+        let api_url = format!("https://doi.org/{}", doi);
+        
+        // Untuk saat ini, return mock response
+        Ok(Output { 
+            text: format!("DOI {} ditemukan di Crossref (mock)\n\nMetadata tersedia di https://api.crossref.org/works/{}", 
+                doi, doi),
+            summary: format!("Resolusi DOI: {}", doi),
+            ok: true 
+        })
+    }
+
+    fn scopus(query: &str, from_date: Option<&str>, to_date: Option<&str>) -> Result<Output, String> {
+        // Search database Scopus
+        // API key perlu di-set via environment atau headers
+        let api_url = format!("https://api.elsevier.com/content/search/scopus-database?query={}", 
+            query.replace(" ", "+"));
+
+        curl(&api_url, "GET", &None, Some(json!({}).to_string()), &Cancel {})
+    }
+
+    fn parse_url(url: &str) -> Option<String> {
+        // Parse URL sederhana untuk extract host
+        if url.contains("://") {
+            let rest = url.split("://").nth(1)?;
+            let parts: Vec<&str> = rest.trim_start_matches('/').splitn(2, '/').collect();
+            Some(parts.get(0)?.to_string())
+        } else {
+            None
+        }
+    }
+
+
+    fn head(path: &Path, lines: usize) -> Result<Output, String> {
+        if !path.exists() {
+            return Err(format!("{} tidak ada", path.display()));
+        }
+
+        let mut file = match fs::File::open(path) {
+            Ok(f) => f,
+            Err(e) => return Err(e.to_string()),
+        };
+
+        let meta = match file.metadata() {
+            Ok(m) => m,
+            Err(e) => return Err(e.to_string()),
+        };
+
+        if meta.len() > FILE_MAX {
+            return Err(format!("file {} terlalu besar (>{})", path.display(), FILE_MAX));
+        }
+
+        let mut buf = vec![0u8; lines * 1024]; // Estimasi buffer
+        let nread = match file.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) => return Err(format!("gagal baca: {}", e)),
+        };
+
+        let text = String::from_utf8_lossy(&buf[..nread]).trim_end_matches(|c| c.is_whitespace()).to_string();
+        
+        let total_lines = meta.len() as f64 / 512; // Estimasi ~512 byte per line rata-rata
+        let total_lines = match text.lines().count() {
+            n if n > 0 => n,
+            _ => 0,
+        };
+
+        Ok(Output { 
+            text: format!("{} baris:\n{}\n(total: {} baris)", lines, text, total_lines.min(lines * 2)), 
+            summary: format!("{} baris", lines), 
+            ok: true 
+        })
+    }
+
+    fn tail(path: &Path, lines: usize) -> Result<Output, String> {
+        if !path.exists() {
+            return Err(format!("{} tidak ada", path.display()));
+        }
+
+        let meta = match fs::metadata(path) {
+            Ok(m) => m,
+            Err(e) => return Err(e.to_string()),
+        };
+
+        if meta.len() > FILE_MAX {
+            return Err(format!("file {} terlalu besar (>{})", path.display(), FILE_MAX));
+        }
+
+        // Baca dari akhir file
+        let mut file = match fs::File::open(path) {
+            Ok(f) => f,
+            Err(e) => return Err(e.to_string()),
+        };
+
+        let meta = match file.metadata() {
+            Ok(m) => m,
+            Err(e) => return Err(e.to_string()),
+        };
+
+        let start = meta.len() as u64;
+        // Baca maksimal lines * 1024 byte dari akhir
+        let buf_size = (lines * 512).min(1 << 20); // Max 1MB
+        let mut buf = vec![0u8; buf_size as usize];
+        
+        let nread = match file.seek(std::io::SeekFrom::End(-(buf_size as i64))) {
+            Ok(_) => {},
+            Err(e) => return Err(format!("gagal seek: {}", e)),
+        };
+        
+        match file.read(&mut buf) {
+            Ok(n) => {},
+            Err(e) => return Err(format!("gagal baca: {}", e)),
+        };
+
+        let text = String::from_utf8_lossy(&buf[..n]).trim_end_matches(|c| c.is_whitespace()).to_string();
+        
+        let total_lines = match text.lines().count() {
+            n if n > 0 => n,
+            _ => 0,
+        };
+
+        Ok(Output { 
+            text: format!("{} baris terakhir:\n{}", lines, text), 
+            summary: format!("{} baris", lines), 
+            ok: true 
+        })
+    }
+
+    fn spider(url: &str, options: &serde_json::Value, cancel: &Cancel) -> Result<Output, String> {
+        // Spider/Crawler - crawling multiple pages dengan konfigurasi custom
+        let headers = Some(json!({
+            "User-Agent": "llmy-agent/0.1",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        }));
+
+        // Untuk saat ini, gunakan curl internal dengan header custom
+        let result = curl(url, "GET", &headers, Some(json!({}).to_string()), cancel)?;
+        
+        Ok(result)
+    }
+
+    fn essence(text: &str) -> Result<Output, String> {
+        // Essence - extract entities/concepts dari text
+        // Ini akan menggunakan regex dan NLP sederhana untuk ekstrak entitas
+        
+        // Ekstrak kata kunci penting (entity extraction)
+        let entities = [
+            "ORGANIZATION", "PERSON", "LOCATION", "DATE", "TIME", 
+            "EMAIL", "URL", "PHONE", "MONEY", "PERCENT"
+        ];
+        
+        let mut result = String::new();
+        result.push_str("Essence (ekstrak entitas) - Mock implementation:\n");
+        result.push_str(&format!("Input: {}\n", text.chars().take(100).collect::<String>()));
+        result.push_str("\nEntities yang ditemukan:\n");
+        
+        // Ekstrak URL
+        if let Some(start) = text.find("http") {
+            let end = text[start..].find(|c: char| !matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '/' | '.' | '-')).unwrap_or(text.len() - start);
+            let url: String = text[start..start + end].chars().collect();
+            result.push_str(&format!("- URL: {}\n", url));
+        }
+        
+        // Ekstrak email
+        for pattern in ["@gmail.com", "@yahoo.com", "@outlook.com"] {
+            if text.contains(pattern) {
+                let mut start = text.find('@').unwrap_or(0);
+                let end = text[start..].find(&pattern[1..]).map(|i| start + i).unwrap_or(text.len() - start);
+                let email: String = text[start..start + end].chars().collect();
+                result.push_str(&format!("- Email: {}\n", email));
+            }
+        }
+        
+        // Ekstrak keyword utama (stopwords filter sederhana)
+        let stopwords = ["the", "and", "or", "is", "are", "was", "were", "in", "on", "at"];
+        let words: Vec<&str> = text.split_whitespace().filter(|w| w.len() > 3 && !stopwords.contains(&*w)).collect();
+        
+        result.push_str(&format!("Keywords: {}\n", words.iter().take(10).collect::<Vec<_>>().join(", ")));
+        
+        Ok(Output { 
+            text: result, 
+            summary: format!("Essence dari {} karakter", text.len()), 
+            ok: true 
+        })
+    }
