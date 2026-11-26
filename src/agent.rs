@@ -10,6 +10,7 @@ use crate::memory;
 use crate::rules;
 use crate::session::{self, Session};
 use crate::tools::{self, Action, Output, Prepared};
+use crate::verify::{self, Check};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -69,6 +70,11 @@ pub struct Agent {
     /// Byte per token, dikalibrasi dari balasan nyata.
     ratio: f64,
     session: Option<Session>,
+    /// Pemeriksaan setelah edit; kosong = mati.
+    checks: Vec<Check>,
+    /// Boleh dijalankan tanpa tanya: ditulis sendiri oleh pengguna, atau dijawab "selalu".
+    verify_ok: bool,
+    vmem: verify::Memory,
 }
 
 enum Step {
@@ -76,7 +82,7 @@ enum Step {
     Stop,
 }
 
-fn system_prompt(cwd: &std::path::Path, rules: &str) -> String {
+fn system_prompt(cwd: &std::path::Path, rules: &str, checks: &[Check]) -> String {
     let mut s = format!(
         "You are llmy, a coding agent working in the user's terminal.\n\
          Working directory: {}\nOS: {}\n\n\
@@ -94,6 +100,10 @@ fn system_prompt(cwd: &std::path::Path, rules: &str) -> String {
          - When the task is done, stop calling tools and summarize in one or two sentences. Report failures honestly.",
         cwd.display(), std::env::consts::OS
     );
+    if !checks.is_empty() {
+        let c: Vec<String> = checks.iter().map(|c| c.describe()).collect();
+        s += &format!("\n- After each step that changes files, llmy runs these checks itself and appends the result to your edit's tool result: {}. Fix every error they report. A file content that already failed a check is rejected if written again.", c.join("; "));
+    }
     if !rules.is_empty() {
         s += "\n\n# Project instructions\nFollow these. The user's own messages take precedence.\n\n";
         s += rules;
@@ -106,11 +116,23 @@ impl Agent {
         let mut a = Agent {
             provider, perm, interactive, cwd, cancel, tx, msgs: vec![], tools: tools::schema(), schema_bytes: 0,
             used: 0, counted: 0, ratio: 3.0, session: None,
+            checks: vec![], verify_ok: false, vmem: verify::Memory::default(),
         };
         // JSON skema + pembungkus per provider (perkiraan).
         a.schema_bytes = a.tools.to_string().len() * 11 / 10;
         a.system();
         a
+    }
+
+    /// `custom`: perintah dari `--verify`/`LLMY_VERIFY` (`off` mematikan). Perintah yang ditulis
+    /// pengguna sendiri tidak ditanya lagi; yang dideteksi llmy ditanya seperti `bash`, karena
+    /// build bisa menjalankan kode proyek (build.rs, skrip npm).
+    pub fn with_verify(mut self, custom: Option<String>) -> Self {
+        self.checks = verify::detect(&self.cwd, custom.as_deref());
+        self.verify_ok = custom.is_some();
+        let m = json!({"role":"system","content":system_prompt(&self.cwd, &rules::load(&self.cwd).text, &self.checks)});
+        self.msgs[0] = m;
+        self
     }
 
     pub fn with_session(mut self, session: Option<Session>, history: Vec<Value>) -> Self {
@@ -124,7 +146,7 @@ impl Agent {
     /// Bangun ulang pesan sistem (juga membaca ulang AGENTS.md).
     fn system(&mut self) {
         let r = rules::load(&self.cwd);
-        let m = json!({"role":"system","content":system_prompt(&self.cwd, &r.text)});
+        let m = json!({"role":"system","content":system_prompt(&self.cwd, &r.text, &self.checks)});
         if self.msgs.is_empty() {
             self.msgs.push(m);
         } else {
@@ -196,6 +218,7 @@ impl Agent {
                     if let Some(s) = &mut self.session {
                         s.reset();
                     }
+                    self.vmem.reset();
                     self.system();
                     self.send(Ev::Info("Percakapan dikosongkan.".into()));
                 }
@@ -548,20 +571,41 @@ impl Agent {
                 return;
             }
             let mut stop = false;
-            for c in &r.calls {
+            let mut outs = vec![];
+            let mut last_write = None;
+            for (i, c) in r.calls.iter().enumerate() {
                 let out = if stop {
                     Output::err("dilewati karena giliran dihentikan")
                 } else {
+                    let before = self.vmem.pending();
                     let (o, s) = self.call(c, &mut history);
+                    if self.vmem.pending() > before {
+                        last_write = Some(i);
+                    }
                     stop = matches!(s, Step::Stop) || self.cancel.is_set();
                     o
                 };
                 fails = if out.ok { 0 } else { fails + 1 };
+                outs.push(out);
+            }
+            // Hasil verifikasi menempel pada hasil edit terakhir: pasangan tool_calls tetap utuh.
+            if let Some(i) = last_write
+                && !stop
+                && let Some(note) = self.verify()
+            {
+                outs[i].text += &note;
+            }
+            for (c, out) in r.calls.iter().zip(outs) {
                 let mut m = json!({"role":"tool","tool_name":c["function"]["name"],"content":out.text});
                 if let Some(id) = c["id"].as_str() {
                     m["tool_call_id"] = json!(id);
                 }
                 self.push(m);
+            }
+            if self.vmem.streak >= verify::MAX_STREAK {
+                let n = self.vmem.streak;
+                self.vmem.streak = 0;
+                return self.send(Ev::Error(format!("Berhenti: verifikasi gagal {n} kali berturut-turut tanpa kemajuan. Ketik \"lanjutkan\" atau beri arahan lain.")));
             }
             if fails >= MAX_FAILS && !stop {
                 return self.send(Ev::Error(format!("Berhenti: {fails} tool gagal berturut-turut. Ketik \"lanjutkan\" atau beri arahan lain.")));
@@ -605,6 +649,15 @@ impl Agent {
                 return (Output::err(e), Step::Continue);
             }
         };
+        if let Action::Write { path, new, .. } = &p.action
+            && !p.memory
+            && self.vmem.tried(path, new)
+        {
+            let e = "this exact file content already failed verification; do not write it again. Read the errors and make a different fix";
+            self.send(Ev::Tool { title: p.title.clone(), detail: vec![] });
+            self.send(Ev::ToolDone { ok: false, summary: "isi ini sudah gagal diverifikasi".into() });
+            return (Output::err(e), Step::Continue);
+        }
         self.send(Ev::Tool { title: p.title.clone(), detail: detail(&p) });
         // Arahkan ke cara tanpa izin dulu, alih-alih langsung mengganggu pengguna.
         if !self.perm.auto(&p)
@@ -651,13 +704,95 @@ impl Agent {
             return (Output::err("dibatalkan pengguna"), Step::Stop);
         }
         let saved = if let (true, Action::Write { new, .. }) = (p.memory, &p.action) { memory::items(new) } else { vec![] };
+        let written = match (&p.action, p.memory) {
+            (Action::Write { path, new, .. }, false) => Some((path.clone(), new.clone())),
+            _ => None,
+        };
         let mut o = tools::run(p, &self.cwd, self.provider.ctx, &self.cancel);
+        if o.ok
+            && let Some((path, new)) = written
+        {
+            self.vmem.wrote(&path, &new);
+        }
         if o.ok && !saved.is_empty() {
             // Dengan isi lengkap, model bisa mengganti fakta yang bertentangan.
             o.text = format!("saved. Memory is now:\n- {}\nIf another line is now wrong, call remember with replaces. Otherwise answer.", saved.join("\n- "));
         }
         self.send(Ev::ToolDone { ok: o.ok, summary: o.summary.clone() });
         (o, Step::Continue)
+    }
+
+    /// Jalankan pemeriksaan untuk file yang diubah di langkah ini. Hasilnya untuk model,
+    /// atau None bila tidak ada yang dijalankan.
+    fn verify(&mut self) -> Option<String> {
+        let changed = self.vmem.changed();
+        let run: Vec<(usize, String)> = self.checks.iter().enumerate().filter_map(|(i, c)| c.command(&changed).map(|cmd| (i, cmd))).collect();
+        if run.is_empty() || self.cancel.is_set() {
+            self.vmem.skip();
+            return None;
+        }
+        self.send(Ev::Tool { title: "verifikasi".into(), detail: run.iter().map(|(_, c)| ('$', 0, c.clone())).collect() });
+        // Build bisa menjalankan kode proyek (build.rs, skrip npm): ditanya seperti bash.
+        let safe = run.iter().all(|(i, _)| self.checks[*i].safe);
+        if !(safe || self.verify_ok || self.perm.is_all() || self.perm.allow_bash) {
+            let off = |a: &mut Self, why: &str| {
+                a.checks.clear();
+                a.vmem.skip();
+                a.send(Ev::ToolDone { ok: false, summary: why.into() });
+            };
+            if !self.interactive {
+                off(self, "dilewati: butuh --allow bash, --auto, atau --verify <perintah>");
+                return None;
+            }
+            let (reply, rx) = channel();
+            self.send(Ev::Ask { question: "Jalankan verifikasi setelah edit?".into(), always: Some("Ya, selalu verifikasi selama sesi"), reply });
+            match rx.recv().unwrap_or(Answer::No) {
+                Answer::Yes => {}
+                Answer::Always => self.verify_ok = true,
+                Answer::No => {
+                    off(self, "verifikasi otomatis dimatikan untuk sesi ini");
+                    return None;
+                }
+            }
+        }
+        let (mut failed, mut ran, mut gone, mut weight) = (vec![], vec![], vec![], 0);
+        for (i, cmd) in &run {
+            let p = Prepared { action: Action::Bash { cmd: cmd.clone(), timeout: 300 }, title: "verifikasi".into(), guarded: false, memory: false };
+            let o = tools::run(p, &self.checks[*i].dir, self.provider.ctx, &self.cancel);
+            if self.cancel.is_set() {
+                self.vmem.skip();
+                self.send(Ev::ToolDone { ok: false, summary: "dibatalkan".into() });
+                return None;
+            }
+            // Alatnya tidak terpasang: bukan kesalahan model.
+            if o.text.ends_with("[exit 127]") {
+                gone.push(*i);
+                continue;
+            }
+            ran.push(cmd.clone());
+            if !o.ok {
+                weight += verify::weight(&o.text);
+                failed.push(format!("$ {cmd}\n{}", verify::errors_first(&o.text)));
+            }
+        }
+        for i in gone.iter().rev() {
+            self.checks.remove(*i);
+        }
+        let missing = if gone.is_empty() { String::new() } else { format!("; {} tidak ditemukan, dimatikan", gone.len()) };
+        if ran.is_empty() {
+            self.vmem.skip();
+            self.send(Ev::ToolDone { ok: false, summary: format!("tidak ada yang dijalankan{missing}") });
+            return None;
+        }
+        if failed.is_empty() {
+            self.vmem.passed();
+            self.send(Ev::ToolDone { ok: true, summary: format!("lulus{missing}") });
+            return Some(format!("\n\n[llmy check passed: {}]", ran.join("; ")));
+        }
+        self.vmem.failed(weight);
+        let n = self.vmem.streak;
+        self.send(Ev::ToolDone { ok: false, summary: format!("gagal ({n}/{}){missing}", verify::MAX_STREAK) });
+        Some(format!("\n\n[llmy check FAILED after this step. Fix these errors:]\n{}", failed.join("\n\n")))
     }
 
     fn ask(&self, p: &Prepared) -> Answer {

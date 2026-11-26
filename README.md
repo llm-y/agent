@@ -12,6 +12,9 @@ Tool: `read`, `head`, `tail`, `grep`, `edit`, `write`, `bash`, `essence`, `remem
 `brightdata` muncul bila kuncinya ada di env. Setiap tindakan ditanya, kecuali dengan `--allow` atau
 mode auto (`--auto`, `/auto`, Shift+Tab).
 
+Setelah edit, llmy sendiri menjalankan pemeriksaan proyek (`cargo check`, `go build`, `tsc`, `py_compile`,
+atau `--verify <perintah>`) dan memberikan galatnya ke model. Isi file yang sudah gagal ditolak bila ditulis lagi.
+
 Instalasi dan manual: <https://ll.my.id>
 
 ```sh

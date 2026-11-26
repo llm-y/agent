@@ -18,6 +18,7 @@ mod sys;
 mod text;
 mod tools;
 mod ui;
+mod verify;
 mod web;
 
 use agent::{Agent, Cmd, Ev};
@@ -64,6 +65,9 @@ Opsi:
       --sessions       daftar sesi di folder ini
       --no-session     jangan simpan sesi
       --allow <daftar> tanpa tanya: edit, bash, memory, web, atau all (pisahkan dengan koma)
+      --verify <cmd>   periksa setelah edit dengan perintah ini (env LLMY_VERIFY); off mematikan.
+                       Bawaan: cargo check, go build/vet, tsc, atau py_compile menurut proyek
+                       (ditanya seperti bash, kecuali --auto atau --allow bash)
       --auto           mode auto: setujui semua tanpa tanya (sama dengan --allow all), kecuali
                        path di luar folder kerja, di .git, atau file rahasia. Interaktif:
                        /auto atau Shift+Tab untuk menyalakan/mematikan
@@ -87,6 +91,7 @@ struct Opts {
     resume: Option<Option<String>>,
     save: bool,
     list: bool,
+    verify: Option<String>,
 }
 
 fn default_model() -> String {
@@ -104,10 +109,11 @@ fn default_model() -> String {
 }
 
 fn parse() -> Result<(Opts, impl FnOnce() -> Result<Provider, String>), String> {
-    let mut o = Opts { perm: Perm::default(), prompt: None, resume: None, save: true, list: false };
+    let mut o = Opts { perm: Perm::default(), prompt: None, resume: None, save: true, list: false, verify: None };
     let mut model = env("LLMY_MODEL").unwrap_or_else(default_model);
     let mut ctx = env("LLMY_CTX");
     let mut tools = env("LLMY_TOOLS").unwrap_or("auto".into());
+    o.verify = env("LLMY_VERIFY");
     let (mut url, mut api_key, mut think, mut effort) = (None, None, false, None);
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -139,6 +145,7 @@ fn parse() -> Result<(Opts, impl FnOnce() -> Result<Provider, String>), String> 
                 effort = Some(e);
             }
             "-p" | "--print" => o.prompt = Some(val()?),
+            "--verify" => o.verify = Some(val()?),
             "--auto" => o.perm.all.store(true, std::sync::atomic::Ordering::Relaxed),
             "--allow" => {
                 for s in val()?.split(',') {
@@ -198,6 +205,7 @@ fn main() {
     });
     let auto = o.perm.all.clone();
     let agent = Agent::new(provider, o.perm, interactive, cwd.clone(), cancel.clone(), tx.clone())
+        .with_verify(o.verify)
         .with_session(session, history);
     let (ctx, crx) = channel();
     std::thread::spawn(move || agent.serve(crx));
