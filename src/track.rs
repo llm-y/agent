@@ -126,7 +126,7 @@ mod tests {
         fs::write(d.join("node_modules/x.js"), "abaikan").unwrap();
         let b = scan(&d, &a);
         let v = diff(&a, &b);
-        let names: Vec<String> = v.iter().map(|c| c.path.strip_prefix(&d).unwrap().to_string_lossy().into_owned()).collect();
+        let names: Vec<String> = v.iter().map(|c| c.path.strip_prefix(&d).unwrap().to_string_lossy().replace('\\', "/")).collect();
         assert_eq!(names, vec!["b.txt", "d.txt", "src/a.rs"]);
         assert_eq!(v[0].before.as_deref(), Some("hapus\n"));
         assert!(v[0].after.is_none());

@@ -36,7 +36,7 @@ pub fn schema() -> Value {
     let i = |d: &str| json!({"type":"integer","description":d});
     let mut v = json!([
         f("read", "Read a text file (with line numbers) or list a directory. With symbol, opens the file at the definition of that function, type, or class (path may then be a directory or omitted).",
-          json!({"path": s("File or directory path, relative to the working directory"), "offset": i("First line, 1-based"), "limit": i("Number of lines"), "symbol": s("Name of a function, method, struct, class, or type to jump to")}), &[]),
+          json!({"path": s("File or directory path, relative to the working directory"), "offset": i("First line, 1-based"), "limit": i("Number of lines"), "symbol": s("Name of a function, method, struct, class, or type; for LaTeX a section title, \\label key, or \\newcommand name; for BibTeX a citation key")}), &[]),
         f("head", "Show the first lines of a text file.",
           json!({"path": s("File path, relative to the working directory"), "lines": i("Number of lines, default 20")}), &["path"]),
         f("tail", "Show the last lines of a text file, e.g. the end of a log.",
@@ -538,34 +538,28 @@ pub fn run(p: Prepared, cwd: &Path, ctx: u64, cancel: &Cancel) -> Output {
     }
 }
 
-/// Definisi `name` (fungsi, method, tipe, kelas) di file atau folder `base`: (file, baris).
+/// Definisi `name` (fungsi, method, tipe, kelas; bagian, label, atau perintah LaTeX; kunci BibTeX)
+/// di file atau folder `base`: (file, baris). Pengenalnya sama dengan peta proyek.
 fn symbol(cwd: &Path, base: &Path, name: &str) -> Result<Vec<(PathBuf, usize)>, String> {
-    if !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
-        return Err("symbol hanya nama, tanpa spasi atau tanda baca (mis. area, Rect)".into());
+    let name = name.trim().trim_start_matches('\\');
+    if name.is_empty() || name.contains('\n') {
+        return Err("symbol berisi satu nama (mis. area, Rect, fig:arsitektur)".into());
     }
-    let re = regex_lite::Regex::new(&format!(
-        r"^\s*(?:(?:pub(?:\([a-z:]+\))?|export|default|async|static|public|private|protected|unsafe|const|abstract|final|override)\s+)*(?:fn|struct|enum|trait|union|type|mod|class|interface|def|func|function|impl)\s+(?:\([^)]*\)\s*)?{}\b",
-        regex_lite::escape(name)
-    )).map_err(|e| e.to_string())?;
     let files: Vec<PathBuf> = if base.is_file() {
         vec![base.to_path_buf()]
     } else {
-        crate::bdi::project_files(base).into_iter().map(|f| base.join(f)).collect()
+        crate::bdi::project_files(base).into_iter().filter(|f| crate::bdi::indexed(f)).map(|f| base.join(f)).collect()
     };
     let mut out = vec![];
     for f in files {
-        if !matches!(f.extension().and_then(|e| e.to_str()), Some("rs" | "go" | "py" | "js" | "mjs" | "ts" | "tsx" | "jsx" | "java" | "kt" | "c" | "h" | "cc" | "cpp" | "hpp" | "cs" | "rb" | "php" | "swift" | "scala" | "dart" | "lua" | "sh"))
-            && !base.is_file()
-        {
-            continue;
-        }
         if is_secret_path(cwd, &f) {
             continue;
         }
         let Ok(t) = fs::read_to_string(&f) else { continue };
-        for (i, l) in t.lines().enumerate() {
-            if re.is_match(l) {
-                out.push((f.clone(), i + 1));
+        let key = f.to_string_lossy().to_string();
+        for (line, _, n) in crate::bdi::defs_in(&key, &t) {
+            if n == name {
+                out.push((f.clone(), line));
             }
         }
     }
@@ -811,7 +805,7 @@ mod tests {
         let t = run(prepare("read", &json!({"symbol": "area", "path": "src/b.py"}), &d).unwrap(), &d, 32_768, &c).text;
         assert!(t.contains("4│def area(r):"), "{t}");
         assert!(prepare("read", &json!({"symbol": "tidak_ada"}), &d).err().unwrap().contains("tidak ditemukan"));
-        assert!(prepare("read", &json!({"symbol": "a b"}), &d).is_err());
+        assert!(prepare("read", &json!({"symbol": "a\nb"}), &d).is_err());
         // Nama yang hanya muncul sebagai pemakaian bukan definisi.
         assert!(prepare("read", &json!({"symbol": "fmt"}), &d).is_err());
     }

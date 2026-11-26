@@ -27,6 +27,10 @@ pub struct Check {
     per_file: bool,
     /// Tidak menjalankan kode proyek (mis. py_compile), jadi boleh tanpa tanya.
     pub safe: bool,
+    /// Ditambahkan setelah daftar file (pemeriksaan per file yang hanya menerima satu file).
+    tail: &'static str,
+    /// LaTeX: perintahnya dibangun dari file utama (`\documentclass`), bukan file yang diubah.
+    tex: bool,
 }
 
 impl Check {
@@ -41,7 +45,21 @@ impl Check {
 
     /// Untuk pesan sistem.
     pub fn describe(&self) -> String {
+        if self.tex {
+            return format!("`{} <main .tex file>` (draft, output to a temporary folder)", self.cmd);
+        }
+        if !self.tail.is_empty() {
+            return "`node --check` on each changed file".into();
+        }
         if self.per_file { format!("`{} <changed files>`", self.cmd) } else { format!("`{}`", self.cmd) }
+    }
+
+    /// Perintah untuk layar dan model: skrip pembungkus pemeriksaan per file diringkas.
+    pub fn shown(&self, full: &str) -> String {
+        match full.strip_prefix(self.cmd.as_str()).and_then(|r| r.strip_suffix(self.tail)) {
+            Some(files) if !self.tail.is_empty() => format!("node --check{files}"),
+            _ => full.to_string(),
+        }
     }
 
     /// Perintah lengkap untuk file yang diubah, atau None bila tidak ada yang relevan.
@@ -50,13 +68,86 @@ impl Check {
         if hit.is_empty() {
             return None;
         }
+        if self.tex {
+            return self.tex_command(&hit);
+        }
         if !self.per_file {
             return Some(self.cmd.clone());
         }
         let mut files: Vec<String> = hit.iter().filter(|p| p.is_file()).map(|p| quote(&rel(&self.dir, p))).collect();
         files.dedup();
-        (!files.is_empty()).then(|| format!("{} {}", self.cmd, files.join(" ")))
+        (!files.is_empty()).then(|| format!("{} {}{}", self.cmd, files.join(" "), self.tail))
     }
+
+    /// Kompilasi draft file utama yang memuat file yang diubah. Keluaran (aux, log) ke folder
+    /// sementara, jadi folder proyek tetap bersih.
+    fn tex_command(&self, hit: &[&PathBuf]) -> Option<String> {
+        let roots = tex_roots(&self.dir, hit);
+        if roots.is_empty() {
+            return None;
+        }
+        let out = std::env::temp_dir().join(format!("llmy-tex-{}", std::process::id()));
+        let mut cmds = vec![];
+        for root in roots.iter().take(3) {
+            let dir = root.parent().unwrap_or(&self.dir);
+            // \include menulis .aux di subfolder yang sama di folder keluaran.
+            for sub in tex_dirs(dir) {
+                let _ = std::fs::create_dir_all(out.join(sub));
+            }
+            let _ = std::fs::create_dir_all(&out);
+            let src = std::fs::read_to_string(root).unwrap_or_default();
+            let engine = if src.contains("!TEX program = lualatex") || src.contains("{luacode}") {
+                "lualatex"
+            } else if src.contains("!TEX program = xelatex") || src.contains("{fontspec}") || src.contains("{xeCJK}") || src.contains("{polyglossia}") {
+                "xelatex"
+            } else {
+                "pdflatex"
+            };
+            let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            cmds.push(format!(
+                "cd {} && {engine} -interaction=nonstopmode -halt-on-error -file-line-error -draftmode -no-shell-escape -output-directory={} {}",
+                quote(&dir.display().to_string()), quote(&out.display().to_string()), quote(&name)
+            ));
+        }
+        Some(cmds.join(" && "))
+    }
+}
+
+fn is_root(p: &Path) -> bool {
+    std::fs::read_to_string(p).is_ok_and(|t| t.lines().any(|l| l.trim_start().starts_with("\\documentclass")))
+}
+
+/// File utama LaTeX: file yang diubah bila ia sendiri punya `\documentclass`; selain itu file
+/// utama di proyek yang menyebut nama file itu (\input, \include, \subfile), atau semuanya.
+fn tex_roots(dir: &Path, hit: &[&PathBuf]) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = hit.iter().filter(|p| p.extension().is_some_and(|e| e == "tex") && is_root(p)).map(|p| p.to_path_buf()).collect();
+    let rest: Vec<&&PathBuf> = hit.iter().filter(|p| !roots.contains(p)).collect();
+    if rest.is_empty() {
+        return roots;
+    }
+    let all: Vec<PathBuf> = crate::bdi::project_files(dir).into_iter().filter(|f| f.ends_with(".tex")).map(|f| dir.join(f)).filter(|p| is_root(p)).take(20).collect();
+    let mut mentioned: Vec<PathBuf> = all.iter().filter(|r| {
+        let t = std::fs::read_to_string(r).unwrap_or_default();
+        rest.iter().any(|p| p.file_stem().is_some_and(|s| t.contains(&*s.to_string_lossy())))
+    }).cloned().collect();
+    if mentioned.is_empty() {
+        mentioned = all;
+    }
+    for m in mentioned {
+        if !roots.contains(&m) {
+            roots.push(m);
+        }
+    }
+    roots
+}
+
+/// Subfolder yang berisi file .tex, relatif terhadap `dir`.
+fn tex_dirs(dir: &Path) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = crate::bdi::project_files(dir).into_iter().filter(|f| f.ends_with(".tex"))
+        .filter_map(|f| Path::new(&f).parent().map(Path::to_path_buf)).filter(|p| !p.as_os_str().is_empty()).collect();
+    v.sort();
+    v.dedup();
+    v
 }
 
 fn rel(dir: &Path, p: &Path) -> String {
@@ -86,10 +177,14 @@ fn find(cwd: &Path, name: &str) -> Option<PathBuf> {
     ancestors(cwd).into_iter().find(|d| d.join(name).is_file())
 }
 
+/// Node 22 meloloskan `node --check` pada .js ber-`export` yang sintaksnya rusak (deteksi modul),
+/// jadi file juga diperiksa sebagai modul ES lewat stdin; nama `[stdin]` diganti nama filenya.
+const JS_TAIL: &str = "; do out=$(node --input-type=module --check < \"$f\" 2>&1) || { printf '%s\\n' \"$out\" | sed \"s|^\\[stdin\\]|$f|\" | grep -v -e '^    at ' -e '^Node.js v'; exit 1; }; node --check \"$f\" || exit $?; done";
+
 /// Pemeriksaan bawaan menurut berkas proyek. `custom`: dari `--verify`/`LLMY_VERIFY`
 /// (`off` mematikan).
 pub fn detect(cwd: &Path, custom: Option<&str>) -> Vec<Check> {
-    let plain = |cmd: String, dir: PathBuf, exts: Vec<&'static str>, names: Vec<&'static str>| Check { cmd, dir, exts, names, per_file: false, safe: false };
+    let plain = |cmd: String, dir: PathBuf, exts: Vec<&'static str>, names: Vec<&'static str>| Check { cmd, dir, exts, names, per_file: false, safe: false, tail: "", tex: false };
     match custom.map(str::trim) {
         Some("off" | "none" | "") => return vec![],
         Some(c) => return vec![plain(c.to_string(), cwd.to_path_buf(), vec![], vec![])],
@@ -113,12 +208,33 @@ pub fn detect(cwd: &Path, custom: Option<&str>) -> Vec<Check> {
     }
     // Python tanpa berkas proyek: cukup periksa sintaks file yang diubah, tanpa menjalankannya.
     let py = if cfg!(windows) { "python" } else { "python3" };
-    v.push(Check { cmd: format!("{py} -m py_compile"), dir: cwd.to_path_buf(), exts: vec!["py"], names: vec![], per_file: true, safe: true });
+    v.push(Check { cmd: format!("{py} -m py_compile"), dir: cwd.to_path_buf(), exts: vec!["py"], names: vec![], per_file: true, safe: true, tail: "", tex: false });
+    // JavaScript (mis. croot.js): periksa sintaks tiap file, tanpa menjalankannya.
+    v.push(Check {
+        cmd: "command -v node >/dev/null || exit 127; for f in".into(), dir: cwd.to_path_buf(), exts: vec!["js", "mjs", "cjs"], names: vec![],
+        per_file: true, safe: true, tail: JS_TAIL, tex: false,
+    });
+    // LaTeX: kompilasi draft tanpa shell escape; keluaran ke folder sementara.
+    let root = ancestors(cwd).pop().unwrap_or_else(|| cwd.to_path_buf());
+    v.push(Check { cmd: "pdflatex".into(), dir: root, exts: vec!["tex", "sty", "cls"], names: vec![], per_file: false, safe: true, tail: "", tex: true });
     v
 }
 
 /// Baris galat: peringatan dibuang bila ada galat, karena pada build yang gagal hanya mengaburkan.
 fn error_lines(out: &str) -> Vec<&str> {
+    // LaTeX mencetak ratusan baris log; galatnya `file.tex:12: pesan` (atau `! pesan`) diikuti `l.12 ...`.
+    let lines: Vec<&str> = out.lines().collect();
+    let tex = |l: &str| l.starts_with("! ") || l.split_once(".tex:").is_some_and(|(_, r)| r.split(':').next().is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())));
+    if lines.iter().any(|l| tex(l)) {
+        let mut v = vec![];
+        for (i, l) in lines.iter().enumerate() {
+            if tex(l) {
+                v.push(*l);
+                v.extend(lines[i + 1..].iter().take(3).filter(|x| x.starts_with("l.")).copied());
+            }
+        }
+        return v;
+    }
     let has_error = out.lines().any(|l| l.to_ascii_lowercase().contains("error"));
     out.lines()
         .filter(|l| !(has_error && l.to_ascii_lowercase().contains("warning")))
@@ -259,7 +375,7 @@ mod tests {
         // Berkas proyek di atas akar git tidak dipakai.
         fs::write(d.join("go.mod"), "").unwrap();
         let v = detect(&sub.join("src"), None);
-        assert_eq!(v.len(), 2, "{v:?}");
+        assert_eq!(v.len(), 4, "{v:?}");
         assert!(v[0].cmd.starts_with("cargo check") && v[0].dir == sub && !v[0].safe && v[1].safe);
         let rs = sub.join("src/main.rs");
         fs::write(&rs, "").unwrap();
@@ -274,6 +390,35 @@ mod tests {
         let c = detect(&sub, Some("make test"));
         assert_eq!(c.len(), 1);
         assert_eq!(c[0].command(&[sub.join("x.md")]).as_deref(), Some("make test"));
+    }
+
+    #[test]
+    fn javascript_dan_latex() {
+        let d = dir("verify-jstex");
+        let sub = d.join("sub");
+        let v = detect(&sub, None);
+        let js = v.iter().find(|c| c.exts.contains(&"js")).unwrap();
+        let f = sub.join("app.js");
+        fs::write(&f, "").unwrap();
+        assert_eq!(js.command(&[f]).unwrap(), format!("command -v node >/dev/null || exit 127; for f in 'app.js'{JS_TAIL}"));
+        assert!(js.safe);
+        assert_eq!(js.shown(&js.command(&[sub.join("app.js")]).unwrap()), "node --check 'app.js'");
+        // Bab di subfolder: yang dikompilasi file utama yang menyebutnya, dari foldernya sendiri.
+        let tex = v.iter().find(|c| c.tex).unwrap();
+        fs::create_dir_all(sub.join("bab")).unwrap();
+        fs::write(sub.join("main.tex"), "% utama\n\\documentclass{article}\n\\begin{document}\\input{bab/satu}\\end{document}\n").unwrap();
+        fs::write(sub.join("lain.tex"), "\\documentclass{article}\n").unwrap();
+        fs::write(sub.join("bab/satu.tex"), "Halo.\n").unwrap();
+        let c = tex.command(&[sub.join("bab/satu.tex")]).unwrap();
+        assert!(c.contains("pdflatex -interaction=nonstopmode -halt-on-error -file-line-error -draftmode -no-shell-escape") && c.ends_with("'main.tex'") && !c.contains("lain.tex"), "{c}");
+        assert!(std::env::temp_dir().join(format!("llmy-tex-{}/bab", std::process::id())).is_dir());
+        fs::write(sub.join("x.tex"), "\\documentclass{article}\\usepackage{fontspec}\n").unwrap();
+        assert!(tex.command(&[sub.join("x.tex")]).unwrap().contains("xelatex"));
+        assert!(tex.command(&[sub.join("README.md")]).is_none());
+        // Galat LaTeX: baris galat dan baris l.N saja, bukan log ratusan baris.
+        let log = "This is pdfTeX\n(./main.tex\nLaTeX2e <2024>\n./main.tex:12: Undefined control sequence.\nl.12 \\foo\n           \nNo pages of output.\n[exit 1]";
+        assert_eq!(errors_first(log), "./main.tex:12: Undefined control sequence.\nl.12 \\foo");
+        assert_eq!(weight(log), 2);
     }
 
     #[test]

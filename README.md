@@ -13,7 +13,8 @@ Tool: `read` (juga per simbol), `head`, `tail`, `grep`, `edit` (juga beberapa ba
 `brightdata` muncul bila kuncinya ada di env. Setiap tindakan ditanya, kecuali dengan `--allow` atau
 mode auto (`--auto`, `/auto`, Shift+Tab).
 
-Setelah edit, llmy sendiri menjalankan pemeriksaan proyek (`cargo check`, `go build`, `tsc`, `py_compile`,
+Bahasa utama: Rust, JavaScript (croot.js), LaTeX, dan Python. Setelah edit, llmy sendiri menjalankan
+pemeriksaan proyek (`cargo check`, `node --check`, kompilasi draft LaTeX, `py_compile`, juga `go build`, `tsc`,
 atau `--verify <perintah>`) dan memberikan galatnya ke model. Isi file yang sudah gagal ditolak bila ditulis lagi.
 
 Provider gratis (Groq, Cerebras, OpenRouter `:free`, Mistral, Cohere, NVIDIA NIM, Cloudflare Workers AI,

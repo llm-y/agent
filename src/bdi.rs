@@ -20,7 +20,7 @@ const MAX_DESIRES: usize = 8;
 const MAX_ATTEMPTS: usize = 3;
 /// Berapa kali satu desire boleh dideliberasi ulang setelah intention-nya diputus.
 const MAX_TRIES: usize = 2;
-const MAP_MAX: usize = 4_000;
+const MAP_MAX: usize = 6_000;
 const SLICE_LINES: usize = 150;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -41,6 +41,15 @@ pub struct Desire {
     tries: usize,
     /// Jawaban terakhir pekerja.
     report: String,
+    /// Diagnosis perencana setelah intention diputus: akar masalah, file, dan langkah baru.
+    advice: Option<Advice>,
+}
+
+#[derive(Clone, Debug)]
+struct Advice {
+    cause: String,
+    files: Vec<String>,
+    steps: Vec<String>,
 }
 
 /// Fakta lingkungan, dari kode, bukan dari model.
@@ -65,6 +74,8 @@ pub struct Intention {
 const PLAN_SYS: &str = "You are the planner of a coding agent. Split the user's goal into small subgoals in the order they must be done. Each subgoal changes at most one or two files and can be checked on its own. A goal that needs one small change, or only an answer or explanation, is ONE subgoal: do not split it. Use exact file paths from the project file list; a new file may be listed too. Copy names, signatures, and constraints from the goal exactly as written; do not reinterpret them. Do not write code. Reply with JSON only, no other text:\n{\"desires\":[{\"id\":\"D1\",\"goal\":\"what to achieve, one sentence\",\"files\":[\"path\"],\"depends_on\":[]}]}";
 
 const DELIB_SYS: &str = "You are the deliberation step of a coding agent. Choose ONE subgoal to do next from the candidates. Use the list of failed approaches so the same dead end is not tried again. Give the files to change and two to five short steps. Do not write code. Reply with JSON only, no other text:\n{\"id\":\"D1\",\"files\":[\"path\"],\"steps\":[\"step\"]}";
+
+const DIAG_SYS: &str = "You are the architect of a coding agent. A worker tried one subgoal several times and failed; its changes were rolled back. From the errors and the attempted diff, find the root cause and give a corrected plan for the next worker. Be concrete: name the files and what to change. Do not write full code. Reply with JSON only, no other text:\n{\"cause\":\"root cause, one or two sentences\",\"files\":[\"path\"],\"steps\":[\"step\"]}";
 
 const WORK_RULE: &str = "\n- You are a worker on ONE subgoal of a larger task, given in the user message. Do only that subgoal; the other subgoals are done separately by other workers. When it is done, stop calling tools and say in one or two sentences what you changed.";
 
@@ -147,16 +158,29 @@ impl Agent {
                     self.send(Ev::Info(format!("✓ {} tercapai", d.id)));
                 }
                 Verdict::Drop(why) => {
+                    let attempted = self.attempted();
                     let n = self.rollback();
                     d.tries += 1;
-                    let errs: String = self.vmem.errors.lines().take(6).collect::<Vec<_>>().join(" | ");
+                    let errs_full = self.vmem.errors.clone();
+                    let errs: String = errs_full.lines().take(6).collect::<Vec<_>>().join(" | ");
                     bel.negative.push(format!("- {} ({}): {} {}", d.id, if it.steps.is_empty() { d.goal.clone() } else { it.steps.join("; ") },
                         why.chars().take(160).collect::<String>(), errs.chars().take(400).collect::<String>()));
                     self.vmem.rollback();
                     bel.errors.clear();
                     if d.tries >= MAX_TRIES {
                         d.status = Status::Dropped;
+                    } else {
+                        // Eskalasi: perencana (bisa model cloud) mencari akar masalahnya.
+                        let d = desires[i].clone();
+                        if let Some(a) = self.diagnose(&goal, &d, &why, &errs_full, &attempted) {
+                            self.send(Ev::Info(format!("Diagnosis {}: {}", d.id, a.cause)));
+                            if let Some(last) = bel.negative.last_mut() {
+                                *last += &format!(" Root cause: {}", a.cause);
+                            }
+                            desires[i].advice = Some(a);
+                        }
                     }
+                    let d = &desires[i];
                     self.send(Ev::Info(format!("✗ {}: intention diputus, {n} file dikembalikan{}", d.id,
                         if d.status == Status::Dropped { "; tujuan ini ditinggalkan" } else { "; direncanakan ulang" })));
                 }
@@ -250,7 +274,7 @@ impl Agent {
             if out.iter().any(|x| x.id == id) {
                 continue;
             }
-            out.push(Desire { id, goal, files: strings(&d["files"]), deps: strings(&d["depends_on"]), status: Status::Pending, tries: 0, report: String::new() });
+            out.push(Desire { id, goal, files: strings(&d["files"]), deps: strings(&d["depends_on"]), status: Status::Pending, tries: 0, report: String::new(), advice: None });
         }
         if out.is_empty() {
             return Err("rencana kosong".into());
@@ -267,7 +291,42 @@ impl Agent {
         Ok(out)
     }
 
+    /// Eskalasi setelah intention diputus: akar masalah dan rencana baru dari perencana.
+    fn diagnose(&mut self, goal: &str, d: &Desire, why: &str, errors: &str, attempted: &str) -> Option<Advice> {
+        self.send(Ev::Work("Mendiagnosis"));
+        let user = format!(
+            "Goal:\n{goal}\n\nSubgoal {}: {}\n\nWhy it stopped: {why}\n\nCheck errors:\n{}\n\nAttempted changes (rolled back):\n{}\n\nProject files:\n{}",
+            d.id, d.goal, or_none(errors), or_none(attempted), repo_map(&self.cwd)
+        );
+        match self.ask_json(DIAG_SYS, user, "Mendiagnosis") {
+            Ok(v) => {
+                let cause = v["cause"].as_str().unwrap_or("").trim().to_string();
+                (!cause.is_empty()).then(|| Advice { cause, files: strings(&v["files"]), steps: strings(&v["steps"]).into_iter().take(6).collect() })
+            }
+            Err(e) => {
+                if !self.cancel.is_set() {
+                    self.send(Ev::Info(format!("Diagnosis gagal ({e}).")));
+                }
+                None
+            }
+        }
+    }
+
     fn deliberate(&mut self, goal: &str, desires: &[Desire], ready: &[usize], bel: &Beliefs) -> Intention {
+        let mut it = self.deliberate_inner(goal, desires, ready, bel);
+        // Rencana hasil diagnosis didahulukan.
+        if let Some(a) = desires.iter().find(|d| d.id == it.id).and_then(|d| d.advice.as_ref()) {
+            if !a.steps.is_empty() {
+                it.steps = a.steps.clone();
+            }
+            if !a.files.is_empty() {
+                it.files = a.files.clone();
+            }
+        }
+        it
+    }
+
+    fn deliberate_inner(&mut self, goal: &str, desires: &[Desire], ready: &[usize], bel: &Beliefs) -> Intention {
         let first = &desires[ready[0]];
         let plain = Intention { id: first.id.clone(), files: first.files.clone(), steps: vec![], attempts: 0, failed: vec![] };
         if ready.len() == 1 && bel.negative.is_empty() {
@@ -327,6 +386,9 @@ impl Agent {
         if !bel.negative.is_empty() {
             u += &format!("\nApproaches that already failed and were rolled back; do not repeat them:\n{}\n", bel.negative.join("\n"));
         }
+        if let Some(a) = &d.advice {
+            u += &format!("\nDiagnosis of the earlier failure (follow it): {}\n", a.cause);
+        }
         if !bel.errors.is_empty() {
             u += &format!("\nCurrent check errors:\n{}\n", bel.errors);
         }
@@ -381,6 +443,28 @@ impl Agent {
             let now = std::fs::read_to_string(p).ok();
             (&now != old).then(|| (p.clone(), now))
         }).collect()
+    }
+
+    /// Perubahan intention ini, ringkas untuk diagnosis: hanya baris yang berubah, sekitar 3000 byte.
+    fn attempted(&self) -> String {
+        let mut out = String::new();
+        for (p, old) in self.snap.iter().flatten() {
+            let now = std::fs::read_to_string(p).ok();
+            if &now == old {
+                continue;
+            }
+            out += &format!("--- {}\n", p.strip_prefix(&self.cwd).unwrap_or(p).display());
+            let d = tools::diff(old.as_deref().unwrap_or(""), now.as_deref().unwrap_or(""));
+            for (m, _, l) in d.iter().filter(|x| x.0 == '+' || x.0 == '-').take(60) {
+                out += &format!("{m}{l}\n");
+            }
+            if out.len() > 3_000 {
+                out.truncate(out.floor_char_boundary(3_000));
+                out += "\n...";
+                break;
+            }
+        }
+        out
     }
 
     /// Kembalikan file ke isi sebelum intention. File baru dihapus.
@@ -451,7 +535,7 @@ enum Verdict {
 }
 
 fn single(goal: &str) -> Desire {
-    Desire { id: "D1".into(), goal: goal.into(), files: vec![], deps: vec![], status: Status::Pending, tries: 0, report: String::new() }
+    Desire { id: "D1".into(), goal: goal.into(), files: vec![], deps: vec![], status: Status::Pending, tries: 0, report: String::new(), advice: None }
 }
 
 fn plan_text(d: &[Desire]) -> String {
@@ -526,26 +610,143 @@ pub fn project_files(cwd: &Path) -> Vec<String> {
 }
 
 /// Daftar file proyek dengan nama simbol tingkat atas.
-pub fn repo_map(cwd: &Path) -> String {
+/// Definisi di peta proyek: baris, signature, nama.
+type Def = (usize, String, String);
+
+/// Baris definisi: fungsi, method, tipe, kelas, di bahasa yang umum.
+const DEF: &str = r"^\s*(?:(?:pub(?:\([a-z:]+\))?|export|default|async|static|public|private|protected|unsafe|abstract|const|extern|final|override|virtual)\s+)*(?:fn|struct|enum|trait|union|impl|class|def|func|function\*?|interface|type)\s+(?:\([^)]*\)\s*)?([A-Za-z_$][A-Za-z0-9_$]*)";
+/// JS/TS: `const nama = (...) =>`, `export const nama = async function`; hanya tingkat atas, karena
+/// fungsi panah di dalam fungsi hanyalah pembantu lokal.
+const ARROW: &str = r"^(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*(?::[^=]+)?=\s*(?:async\s+)?(?:function\b|\([^)]*\)\s*(?::[^=]+)?=>|[A-Za-z_$][A-Za-z0-9_$]*\s*=>)";
+/// LaTeX: bagian (nama = judul), label, dan perintah/lingkungan buatan sendiri.
+const TEX: &str = r"\\(?:(?:part|chapter|section|subsection|subsubsection|paragraph)\*?(?:\[[^\]]*\])?\{([^}]+)\}|label\{([^}]+)\}|(?:newcommand|renewcommand|providecommand|DeclareMathOperator|DeclareRobustCommand)\*?\{?\\([A-Za-z@]+)|(?:newenvironment|newtheorem)\*?\{([A-Za-z@*]+)\})";
+/// BibTeX: kunci sitasi.
+const BIB: &str = r"^\s*@[A-Za-z]+\s*\{\s*([^,\s]+)\s*,";
+
+struct Res {
+    def: regex_lite::Regex,
+    arrow: regex_lite::Regex,
+    tex: regex_lite::Regex,
+    bib: regex_lite::Regex,
+}
+static RES: std::sync::OnceLock<Res> = std::sync::OnceLock::new();
+
+fn res() -> &'static Res {
+    RES.get_or_init(|| Res {
+        def: regex_lite::Regex::new(DEF).unwrap(),
+        arrow: regex_lite::Regex::new(ARROW).unwrap(),
+        tex: regex_lite::Regex::new(TEX).unwrap(),
+        bib: regex_lite::Regex::new(BIB).unwrap(),
+    })
+}
+
+/// Bahasa yang dikenali peta proyek dan `read` dengan `symbol`.
+pub fn indexed(path: &str) -> bool {
+    let ext = Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("");
+    !path.ends_with(".min.js")
+        && matches!(ext, "rs" | "py" | "js" | "mjs" | "cjs" | "ts" | "tsx" | "jsx" | "tex" | "sty" | "cls" | "bib"
+            | "go" | "java" | "kt" | "c" | "h" | "cc" | "cpp" | "hpp" | "cs" | "rb" | "php" | "swift" | "scala" | "dart" | "lua" | "sh")
+}
+
+/// Definisi dalam satu file: (baris, signature, nama).
+pub fn defs_in(path: &str, text: &str) -> Vec<Def> {
+    let ext = Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("");
+    let r = res();
+    let js = matches!(ext, "js" | "mjs" | "cjs" | "ts" | "tsx" | "jsx");
+    let mut v = vec![];
+    // File hasil minify: satu baris panjang, bukan untuk dibaca.
+    if js && text.lines().any(|l| l.len() > 2_000) {
+        return v;
+    }
+    let mut in_block = false;
+    for (i, l) in text.lines().enumerate() {
+        let t = l.trim_start();
+        let name = match ext {
+            "tex" | "sty" | "cls" => {
+                if t.starts_with('%') {
+                    continue;
+                }
+                // Satu baris bisa memuat bagian dan labelnya sekaligus.
+                let code = l.split_once('%').map_or(l, |(c, _)| if c.ends_with('\\') { l } else { c });
+                for c in r.tex.captures_iter(code) {
+                    if let Some(m) = (1..=4).find_map(|k| c.get(k)) {
+                        v.push((i + 1, l.trim().chars().take(100).collect(), m.as_str().trim().to_string()));
+                    }
+                }
+                continue;
+            }
+            "bib" => r.bib.captures(l).and_then(|c| c.get(1)).map(|m| m.as_str().to_string()),
+            _ => {
+                // Komentar blok /* ... */ dilewati.
+                if in_block {
+                    in_block = !t.contains("*/");
+                    continue;
+                }
+                if t.starts_with("/*") && !t.contains("*/") {
+                    in_block = true;
+                    continue;
+                }
+                if t.starts_with("//") || t.starts_with('#') && ext != "py" && ext != "rb" && ext != "sh" {
+                    continue;
+                }
+                r.def.captures(l).or_else(|| if js { r.arrow.captures(l) } else { None })
+                    .and_then(|c| c.get(1)).map(|m| m.as_str().to_string())
+            }
+        };
+        if let Some(name) = name {
+            // Badan satu baris (`{ 0 }`) bukan bagian signature.
+            let head = if matches!(ext, "tex" | "sty" | "cls" | "bib") { l.trim() } else { l.trim().split(" {").next().unwrap_or("") };
+            let sig = head.trim_end_matches(['{', ':', ' ']).trim_end();
+            v.push((i + 1, sig.chars().take(100).collect(), name));
+        }
+    }
+    v
+}
+
+/// Definisi per file proyek.
+pub fn definitions(cwd: &Path) -> Vec<(String, Vec<Def>)> {
     let mut files = project_files(cwd);
     files.truncate(400);
-    let re = regex_lite::Regex::new(r"^\s*(?:pub(?:\([a-z]+\))?\s+)?(?:export\s+)?(?:async\s+)?(?:fn|struct|enum|trait|impl|class|def|func|function|interface|type)\s+([A-Za-z_][A-Za-z0-9_]*)").unwrap();
-    let mut out = String::new();
-    for f in &files {
-        let mut line = f.clone();
-        let src = matches!(Path::new(f).extension().and_then(|e| e.to_str()), Some("rs" | "go" | "py" | "js" | "ts" | "tsx" | "jsx" | "java" | "kt" | "c" | "h" | "cpp" | "cs" | "rb" | "php" | "swift"));
-        if src
-            && let Ok(t) = std::fs::read_to_string(cwd.join(f))
+    let mut defs = vec![];
+    for f in files {
+        let mut v = vec![];
+        if indexed(&f)
+            && let Ok(t) = std::fs::read_to_string(cwd.join(&f))
             && t.len() < 300_000
         {
-            let mut names: Vec<&str> = t.lines().filter_map(|l| re.captures(l).and_then(|c| c.get(1)).map(|m| m.as_str())).collect();
-            names.dedup();
-            let more = names.len() > 12;
-            names.truncate(12);
-            if !names.is_empty() {
-                line += &format!(": {}{}", names.join(", "), if more { ", ..." } else { "" });
-            }
+            v = defs_in(&f, &t);
         }
+        defs.push((f, v));
+    }
+    defs
+}
+
+/// Peta proyek untuk perencana: file dengan signature definisinya.
+pub fn repo_map(cwd: &Path) -> String {
+    let defs = definitions(cwd);
+    let files = &defs;
+    // Signature lengkap dengan nomor baris, agar model tahu rentang yang perlu dibaca; bila
+    // terlalu besar, cukup nama.
+    let full: String = defs.iter().map(|(f, v)| {
+        let mut s = format!("{f}\n");
+        for (n, sig, _) in v.iter().take(25) {
+            s += &format!("  {n}: {sig}\n");
+        }
+        if v.len() > 25 {
+            s += &format!("  ... {} lagi\n", v.len() - 25);
+        }
+        s
+    }).collect();
+    if full.len() <= MAP_MAX {
+        return or_none(&full);
+    }
+    let mut out = String::new();
+    for (f, v) in &defs {
+        let mut names: Vec<&str> = v.iter().map(|x| x.2.as_str()).collect();
+        names.dedup();
+        let more = names.len() > 12;
+        names.truncate(12);
+        let line = if names.is_empty() { f.to_string() } else { format!("{f}: {}{}", names.join(", "), if more { ", ..." } else { "" }) };
         if out.len() + line.len() > MAP_MAX {
             out += &format!("... ({} file lagi)\n", files.len() - out.lines().count());
             break;
@@ -599,8 +800,32 @@ mod tests {
         std::fs::write(d.join("src/lib.rs"), "pub struct Rect;\npub fn area(r: &Rect) -> u32 { 0 }\nfn util() {}\n").unwrap();
         std::fs::write(d.join("target/x.rs"), "fn hidden() {}").unwrap();
         let m = repo_map(&d);
-        assert!(m.contains("src/lib.rs: Rect, area, util"), "{m}");
+        assert!(m.contains("src/lib.rs\n  1: pub struct Rect;\n  2: pub fn area(r: &Rect) -> u32\n  3: fn util()"), "{m}");
         assert!(!m.contains("hidden"), "{m}");
+        // Proyek besar: cukup nama per file.
+        for i in 0..200 {
+            std::fs::write(d.join(format!("src/m{i}.rs")), format!("pub fn fungsi_panjang_{i}(a: u32, b: u32) -> u32 {{ a }}\npub struct Tipe{i};\n")).unwrap();
+        }
+        let m = repo_map(&d);
+        assert!(m.len() <= MAP_MAX + 100 && m.contains("src/lib.rs: Rect, area, util"), "{}", &m[..300]);
+    }
+
+    #[test]
+    fn definisi_js_latex_bib() {
+        let js = "import { x } from './a.js';\nexport function getJSON(url) {\n}\nexport const postJSON = async (url, data) => {};\nconst kecil = n => n + 1;\nconst angka = 5;\n/*\nfunction bukan() {}\n*/\nexport default class Peta {\n}\n";
+        let names: Vec<String> = defs_in("lib/api.js", js).into_iter().map(|d| d.2).collect();
+        assert_eq!(names, vec!["getJSON", "postJSON", "kecil", "Peta"]);
+        assert!(defs_in("lib/api.min.js", js).is_empty() || !indexed("lib/api.min.js"));
+        let min = format!("export function a(){{{}}}", "x;".repeat(1500));
+        assert!(defs_in("lib/b.js", &min).is_empty());
+        let tex = "\\documentclass{article}\n\\newcommand{\\R}{\\mathbb{R}}\n\\DeclareMathOperator*{\\argmax}{arg\\,max}\n% \\section{Komentar}\n\\section{Pendahuluan}\\label{sec:intro}\n\\subsection*[Pendek]{Latar Belakang}\n\\begin{figure}\\label{fig:arsitektur}\\end{figure}\n\\newenvironment{bukti}{}{}\n";
+        let d = defs_in("main.tex", tex);
+        let names: Vec<&str> = d.iter().map(|x| x.2.as_str()).collect();
+        assert_eq!(names, vec!["R", "argmax", "Pendahuluan", "sec:intro", "Latar Belakang", "fig:arsitektur", "bukti"]);
+        assert_eq!((d[2].0, d[3].0), (5, 5));
+        let bib = "@article{awangga2024,\n  title={X},\n}\n@Book{ knuth84 ,\n";
+        let names: Vec<String> = defs_in("ref.bib", bib).into_iter().map(|d| d.2).collect();
+        assert_eq!(names, vec!["awangga2024", "knuth84"]);
     }
 
     #[test]
@@ -608,5 +833,31 @@ mod tests {
         let s = strings(&json!(["D1", " ", 3, "D2"]));
         assert_eq!(s, vec!["D1", "D2"]);
         assert_eq!(strings(&json!("src/a.rs")), vec!["src/a.rs"]);
+    }
+}
+
+#[cfg(test)]
+mod ukur {
+    /// Cetak definisi hasil pemindai untuk folder di env LLMY_PETA (pengukuran recall, bukan uji biasa).
+    #[test]
+    #[ignore]
+    fn cetak_definisi() {
+        let Ok(d) = std::env::var("LLMY_PETA") else { return };
+        // Daftar file (satu path per baris) atau folder proyek.
+        if d.ends_with(".txt") {
+            for f in std::fs::read_to_string(&d).unwrap().lines() {
+                let t = std::fs::read_to_string(f).unwrap_or_default();
+                for (n, _, name) in super::defs_in(f, &t) {
+                    println!("DEF\t{f}\t{n}\t{name}");
+                }
+            }
+            return;
+        }
+        let d = std::path::Path::new(&d);
+        for (f, v) in super::definitions(d) {
+            for (n, _, name) in v {
+                println!("DEF\t{f}\t{n}\t{name}");
+            }
+        }
     }
 }
