@@ -74,6 +74,11 @@ pub struct Provider {
     /// Server tetap menolak riwayat thinking: matikan thinking.
     pub no_think: bool,
     pub detected: bool,
+    /// Setelan per fase BDI: suhu, dan minta JSON (Ollama `format`, Gemini mime type).
+    pub temperature: Option<f64>,
+    pub json: bool,
+    /// Status HTTP kegagalan terakhir (0 = sebelum ada status); untuk memilih cadangan.
+    pub failed: Option<u16>,
     /// Pengaturan API khusus sesi aktif (tidak ditulis ke disk).
     pub session_apis: BTreeMap<String, api::Profile>,
     api_key: Option<String>,
@@ -194,7 +199,7 @@ impl Provider {
         }
         let has_url = url.is_some();
         let disk = cfg.providers.get(&profile);
-        let pre_url = api::preset(&profile).map(|(_, u)| u.to_string());
+        let pre_url = api::preset(&profile).map(|(_, u)| u);
         if let Some(k) = cli_key.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
             let entry = session_apis.entry(profile.clone()).or_insert_with(|| api::Profile {
                 protocol: kind,
@@ -234,6 +239,10 @@ impl Provider {
             }
         } else if let Some(k) = disk.and_then(|p| p.key.clone()) {
             (Some(k), false)
+        } else if let Some(f) = crate::setup::find(&profile) {
+            // Provider gratis: hanya dari env miliknya sendiri, misalnya GROQ_API_KEY. Kunci
+            // OPENAI_API_KEY tidak boleh terkirim ke provider lain.
+            (f.env.iter().find_map(|e| env(e)), false)
         } else {
             env_key(kind)
         };
@@ -256,6 +265,9 @@ impl Provider {
             echo: false,
             no_think: false,
             detected: false,
+            temperature: None,
+            json: false,
+            failed: None,
             session_apis,
             api_key,
             auth_bearer,
@@ -317,7 +329,8 @@ impl Provider {
         if self.kind == Kind::Ollama {
             return Ok(vec![]);
         }
-        let name = env_key_name(self.kind);
+        let free = crate::setup::find(&self.profile).filter(|_| !api::is_builtin(&self.profile));
+        let name = free.map_or(env_key_name(self.kind), |f| f.env[0]);
         let h = self.api_key.as_ref().map(|k| match self.kind {
             Kind::Anthropic if self.auth_bearer => ("Authorization", format!("Bearer {k}")),
             Kind::Anthropic => ("x-api-key", k.clone()),
@@ -335,6 +348,8 @@ impl Provider {
                 return Err(format!("{name} tidak dikirim lewat http ke {}; pakai https", self.base));
             }
             Some(h) => v.push(h),
+            // Provider yang memang bisa dipakai tanpa akun (Kilo, OVH, LLM7).
+            None if free.is_some_and(|f| f.keyless) => {}
             None if !local && !lan => {
                 return Err(format!(
                     "{name} belum diatur untuk {} (set env atau pakai `llmy api set` / `/api`)",
@@ -362,6 +377,7 @@ impl Provider {
         cancel: &Cancel,
         on: &mut dyn FnMut(Delta),
     ) -> Result<Reply, String> {
+        self.failed = None;
         self.detect(cancel, on);
         if !self.text_tools {
             match self.send(msgs, tools, mode, cancel, on) {
@@ -414,6 +430,7 @@ impl Provider {
                 }
                 Err(e) => e,
             };
+            self.failed = Some(e.status);
             if cancel.is_set() || emitted {
                 return Err(e);
             }
@@ -429,6 +446,7 @@ impl Provider {
             }
             let wait = e.retry_after.unwrap_or(1 << attempt);
             if !self.retryable(&e) || attempt >= RETRIES || wait > 60 {
+                self.failed = Some(e.status);
                 return Err(e);
             }
             attempt += 1;
@@ -462,6 +480,13 @@ impl Provider {
             on(Delta::Note("Server menolak riwayat thinking; thinking dimatikan untuk model ini."));
         }
         true
+    }
+
+    /// Kegagalan yang layak dialihkan ke provider cadangan: kuota/batas habis, server
+    /// bermasalah, atau server tak terjangkau. Bukan kunci salah atau permintaan salah.
+    pub fn exhausted(&self) -> bool {
+        matches!(self.failed, Some(402 | 408 | 409 | 429 | 500..=599))
+            || self.failed == Some(0) && self.kind != Kind::Ollama
     }
 
     fn retryable(&self, e: &Fail) -> bool {

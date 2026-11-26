@@ -57,6 +57,9 @@ pub fn chat(p: &Provider, msgs: &[Value], tools: &Value, mode: Mode, cancel: &Ca
     if with_tools {
         body["tools"] = tools.clone();
     }
+    if let Some(t) = p.temperature {
+        body["temperature"] = json!(t);
+    }
     if let Some(e) = &p.effort {
         body["reasoning_effort"] = json!(e);
     }

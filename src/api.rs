@@ -22,6 +22,10 @@ pub struct Profile {
 pub struct Config {
     pub default: Option<String>,
     pub providers: BTreeMap<String, Profile>,
+    /// Alur bawaan (`loop`/`bdi`), model perencana BDI, dan model cadangan.
+    pub mode: Option<String>,
+    pub plan: Option<String>,
+    pub fallback: Vec<String>,
 }
 
 /// Lokasi berkas konfigurasi API (hanya dapat dibaca pemilik).
@@ -30,17 +34,26 @@ pub fn file() -> Option<PathBuf> {
 }
 
 /// Nama provider/alias yang dikenal beserta protokol dan alamat bawaannya.
-pub fn preset(name: &str) -> Option<(Kind, &'static str)> {
-    Some(match name {
+pub fn preset(name: &str) -> Option<(Kind, String)> {
+    let (k, u): (Kind, &str) = match name {
         "ollama" => (Kind::Ollama, "http://localhost:11434"),
         "anthropic" => (Kind::Anthropic, anthropic::BASE),
         "openai" => (Kind::OpenAi, openai::BASE),
         "gemini" => (Kind::Gemini, gemini::BASE),
         "deepseek" => (Kind::OpenAi, "https://api.deepseek.com"),
         "xai" => (Kind::OpenAi, "https://api.x.ai/v1"),
-        // Provider gratis dari `llmy setup`; Cloudflare butuh Account ID di alamatnya.
-        _ => return crate::setup::find(name).filter(|f| !f.base.contains('{')).map(|f| (Kind::OpenAi, f.base)),
-    })
+        // Provider gratis dari `llmy setup`. Cloudflare butuh Account ID di alamatnya: dari
+        // CLOUDFLARE_ACCOUNT_ID, atau dari `llmy setup`.
+        _ => {
+            let f = crate::setup::find(name)?;
+            if !f.base.contains('{') {
+                return Some((f.kind, f.base.into()));
+            }
+            let a = crate::provider::env("CLOUDFLARE_ACCOUNT_ID").filter(|a| crate::setup::valid_account(a))?;
+            return Some((f.kind, f.base.replace("{account}", &a)));
+        }
+    };
+    Some((k, u.into()))
 }
 
 pub fn is_builtin(name: &str) -> bool {
@@ -114,6 +127,9 @@ impl Config {
         let mut cfg = Config {
             default: non_empty(&v["default"]),
             providers: BTreeMap::new(),
+            mode: non_empty(&v["mode"]),
+            plan: non_empty(&v["plan"]),
+            fallback: v["fallback"].as_array().into_iter().flatten().filter_map(|s| s.as_str().map(String::from)).collect(),
         };
         if let Some(map) = v["providers"].as_object() {
             for (name, p) in map {
@@ -152,6 +168,15 @@ impl Config {
         let mut root = json!({ "providers": Value::Object(providers) });
         if let Some(d) = &self.default {
             root["default"] = json!(d);
+        }
+        if let Some(m) = &self.mode {
+            root["mode"] = json!(m);
+        }
+        if let Some(p) = &self.plan {
+            root["plan"] = json!(p);
+        }
+        if !self.fallback.is_empty() {
+            root["fallback"] = json!(self.fallback);
         }
         let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
@@ -281,13 +306,13 @@ pub fn build_profile(name: &str, existing: Option<&Profile>, o: SetOpts) -> Resu
     let protocol = o
         .protocol
         .or_else(|| existing.map(|p| p.protocol))
-        .or_else(|| pre.map(|(k, _)| k))
+        .or_else(|| pre.as_ref().map(|(k, _)| *k))
         .unwrap_or(Kind::OpenAi);
     let url = o
         .url
         .map(|u| u.trim().trim_end_matches('/').to_string())
         .or_else(|| existing.and_then(|p| p.url.clone()))
-        .or_else(|| pre.map(|(_, u)| u.to_string()));
+        .or_else(|| pre.map(|(_, u)| u));
     let key = if o.no_key {
         None
     } else {
@@ -414,12 +439,20 @@ const API_HELP: &str = "Pengaturan API multi-provider:
     --default                               jadikan provider bawaan saat mulai
   llmy api use <nama> [model]               jadikan provider bawaan saat mulai
   llmy api remove <nama>                    hapus provider tersimpan
+  llmy api mode <loop|bdi>                  alur bawaan saat mulai
+  llmy api plan <profil/model|off>          model perencana mode BDI (bawaan: model utama)
+  llmy api fallback <m1,m2,...|off>         model cadangan bila kuota habis atau server bermasalah
 
 Contoh:
   llmy api set anthropic --key sk-ant-... --model claude-opus-5-5
   llmy api set gemini --key AIza... --model gemini-2.5-flash
   llmy api set deepseek --key sk-... --model deepseek-chat --default
   llmy api set vllm --protocol openai --url http://192.168.1.5:8000/v1 --no-key --model qwen";
+
+/// `a, b,c` -> [a, b, c].
+pub fn split_list(s: &str) -> Vec<String> {
+    s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()
+}
 
 fn prompt_secret(prompt: &str) -> Result<Option<String>, String> {
     eprint!("{prompt}");
@@ -516,7 +549,7 @@ fn run_cli(args: &[String]) -> Result<String, String> {
             } else if let Some((proto, url)) = preset(name) {
                 cfg.providers.insert(name.clone(), Profile {
                     protocol: proto,
-                    url: Some(url.into()),
+                    url: Some(url),
                     key: None,
                     model,
                 });
@@ -543,6 +576,30 @@ fn run_cli(args: &[String]) -> Result<String, String> {
             }
             cfg.save()?;
             Ok(format!("Provider '{name}' dihapus."))
+        }
+        "mode" => {
+            let m = args.get(1).ok_or("pakai: llmy api mode <loop|bdi>")?;
+            if crate::agent::Flow::parse(m).is_none() {
+                return Err(format!("alur tidak dikenal: {m} (loop atau bdi)"));
+            }
+            let mut cfg = Config::load_strict()?;
+            cfg.mode = Some(m.clone());
+            cfg.save()?;
+            Ok(format!("Alur bawaan sekarang {m}."))
+        }
+        "plan" => {
+            let m = args.get(1).ok_or("pakai: llmy api plan <profil/model|off>")?;
+            let mut cfg = Config::load_strict()?;
+            cfg.plan = (m != "off").then(|| m.clone());
+            cfg.save()?;
+            Ok(if m == "off" { "Perencana BDI memakai model utama.".into() } else { format!("Perencana BDI: {m}.") })
+        }
+        "fallback" => {
+            let m = args.get(1).ok_or("pakai: llmy api fallback <m1,m2,...|off>")?;
+            let mut cfg = Config::load_strict()?;
+            cfg.fallback = if m == "off" { vec![] } else { split_list(m) };
+            cfg.save()?;
+            Ok(if cfg.fallback.is_empty() { "Cadangan dimatikan.".into() } else { format!("Cadangan: {}.", cfg.fallback.join(", ")) })
         }
         _ => Err(format!("subperintah tidak dikenal: {sub} (lihat `llmy api --help`)")),
     }

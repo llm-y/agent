@@ -40,6 +40,12 @@ fn once(
     if mode == Mode::Summary {
         body["options"]["num_predict"] = json!(1200);
     }
+    if let Some(t) = p.temperature {
+        body["options"]["temperature"] = json!(t);
+    }
+    if p.json {
+        body["format"] = json!("json");
+    }
     if let Some(t) = think {
         body["think"] = json!(t);
     }

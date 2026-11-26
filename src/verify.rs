@@ -165,6 +165,8 @@ pub struct Memory {
     pub streak: usize,
     /// Banyaknya galat pada kegagalan terakhir.
     last: Option<usize>,
+    /// Galat terakhir, untuk belief mode BDI.
+    pub errors: String,
 }
 
 impl Memory {
@@ -198,6 +200,21 @@ impl Memory {
         self.step.clear();
         self.streak = 0;
         self.last = None;
+        self.errors.clear();
+    }
+
+    /// Tidak ada verifikasi yang gagal sejak terakhir lulus.
+    pub fn clean(&self) -> bool {
+        self.last.is_none()
+    }
+
+    /// File dikembalikan ke keadaan sebelum intention: status build ikut kembali, tetapi isi
+    /// yang sudah gagal tetap ditolak.
+    pub fn rollback(&mut self) {
+        self.step.clear();
+        self.streak = 0;
+        self.last = None;
+        self.errors.clear();
     }
 
     /// `weight`: banyaknya galat. Refactor lintas file wajar gagal di tengah jalan; selama

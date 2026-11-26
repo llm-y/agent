@@ -105,6 +105,12 @@ fn body(p: &Provider, msgs: &[Value], tools: &Value, mode: Mode) -> Value {
     let mut cfg = json!({
         "maxOutputTokens": if mode == Mode::Turn { p.max_out } else { p.max_out.min(8_000) }
     });
+    if let Some(t) = p.temperature {
+        cfg["temperature"] = json!(t);
+    }
+    if p.json {
+        cfg["responseMimeType"] = json!("application/json");
+    }
     if p.no_think {
         cfg["thinkingConfig"] = json!({"thinkingBudget": 0});
     } else if p.think {

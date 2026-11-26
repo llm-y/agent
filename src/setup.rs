@@ -22,6 +22,12 @@ const WINDOW: usize = 10;
 pub struct Free {
     /// Nama profil di api.json, dipakai sebagai `-m <name>/<model>`.
     pub name: &'static str,
+    /// Protokol: OpenAI, kecuali Gemini (native).
+    pub kind: Kind,
+    /// Env kunci, yang pertama untuk pesan; dipakai bila api.json tidak menyimpan kunci.
+    pub env: &'static [&'static str],
+    /// Bisa dipakai tanpa akun: tanpa kunci, header Authorization tidak dikirim.
+    pub keyless: bool,
     pub label: &'static str,
     /// Alamat protokol OpenAI; `{account}` diganti Account ID (Cloudflare).
     pub base: &'static str,
@@ -42,52 +48,117 @@ pub struct Free {
 
 // Diperiksa dengan dokumentasi resmi pada 2026-11-26; ID model cepat berganti, jadi daftar
 // dari server didahulukan dan yang di sini hanya saran.
-pub const FREE: [Free; 7] = [
+pub const FREE: [Free; 15] = [
     Free {
-        name: "groq", label: "Groq", base: "https://api.groq.com/openai/v1", list: None, check: None, public_list: false,
+        name: "groq", kind: Kind::OpenAi, env: &["GROQ_API_KEY"], keyless: false,
+        label: "Groq", base: "https://api.groq.com/openai/v1", list: None, check: None, public_list: false,
         key_url: "https://console.groq.com/keys", key_hint: "",
         models: &["openai/gpt-oss-120b", "qwen/qwen3.8-27b", "llama-3.3-70b-versatile"],
         only_free: false, note: "sangat cepat; gratis 30 permintaan dan 8K token per menit",
     },
     Free {
-        name: "cerebras", label: "Cerebras", base: "https://api.cerebras.ai/v1", list: None, check: None, public_list: false,
+        name: "cerebras", kind: Kind::OpenAi, env: &["CEREBRAS_API_KEY"], keyless: false,
+        label: "Cerebras", base: "https://api.cerebras.ai/v1", list: None, check: None, public_list: false,
         key_url: "https://cloud.cerebras.ai", key_hint: "",
         models: &["qwen-3.8-27b", "gpt-oss-120b"],
         only_free: false, note: "sangat cepat; kredit uji coba, gpt-oss-120b hanya 5 permintaan per menit",
     },
     Free {
-        name: "openrouter", label: "OpenRouter (model :free)", base: "https://openrouter.ai/api/v1", list: None,
+        name: "openrouter", kind: Kind::OpenAi, env: &["OPENROUTER_API_KEY"], keyless: false,
+        label: "OpenRouter (model :free)", base: "https://openrouter.ai/api/v1", list: None,
         check: Some("https://openrouter.ai/api/v1/key"), public_list: true,
         key_url: "https://openrouter.ai/keys", key_hint: "sk-or-v1-",
         models: &["nvidia/nemotron-3-ultra-550b-a55b:free", "google/gemma-4-31b-it:free"],
         only_free: true, note: "model :free berganti-ganti; 20 permintaan per menit, 50 per hari",
     },
     Free {
-        name: "mistral", label: "Mistral AI", base: "https://api.mistral.ai/v1", list: None, check: None, public_list: false,
+        name: "mistral", kind: Kind::OpenAi, env: &["MISTRAL_API_KEY"], keyless: false,
+        label: "Mistral AI", base: "https://api.mistral.ai/v1", list: None, check: None, public_list: false,
         key_url: "https://admin.mistral.ai/organization/api-keys", key_hint: "",
         models: &["mistral-large-4-0", "mistral-medium-latest", "mistral-small-latest"],
         only_free: false, note: "BUKAN gratis lagi: API butuh aktivasi billing (pay-as-you-go)",
     },
     Free {
-        name: "cohere", label: "Cohere", base: "https://api.cohere.ai/compatibility/v1",
+        name: "cohere", kind: Kind::OpenAi, env: &["COHERE_API_KEY"], keyless: false,
+        label: "Cohere", base: "https://api.cohere.ai/compatibility/v1",
         list: Some("https://api.cohere.com/v1/models?endpoint=chat"), check: None, public_list: false,
         key_url: "https://dashboard.cohere.com/api-keys", key_hint: "",
         models: &["command-a-plus-05-2026", "command-a-03-2025", "command-a-reasoning-08-2025"],
         only_free: false, note: "kunci trial: 20 permintaan per menit, 1.000 per bulan",
     },
     Free {
-        name: "nvidia", label: "NVIDIA NIM", base: "https://integrate.api.nvidia.com/v1", list: None, check: None, public_list: true,
+        name: "nvidia", kind: Kind::OpenAi, env: &["NVIDIA_API_KEY"], keyless: false,
+        label: "NVIDIA NIM", base: "https://integrate.api.nvidia.com/v1", list: None, check: None, public_list: true,
         key_url: "https://build.nvidia.com (Get API Key di halaman model)", key_hint: "",
         models: &["moonshotai/kimi-k3.1-pro", "z-ai/glm-5.3-flash", "nvidia/nemotron-3-ultra-550b-a55b"],
         only_free: false, note: "gratis untuk pengembangan; sekitar 40 permintaan per menit",
     },
     Free {
-        name: "cloudflare", label: "Cloudflare Workers AI", base: "https://api.cloudflare.com/client/v4/accounts/{account}/ai/v1",
+        name: "cloudflare", kind: Kind::OpenAi, env: &["CLOUDFLARE_API_TOKEN"], keyless: false,
+        label: "Cloudflare Workers AI", base: "https://api.cloudflare.com/client/v4/accounts/{account}/ai/v1",
         list: Some("https://api.cloudflare.com/client/v4/accounts/{account}/ai/models/search?task=Text%20Generation"),
         check: None, public_list: false,
         key_url: "https://dash.cloudflare.com/profile/api-tokens (API token, izin Workers AI)", key_hint: "",
         models: &["@cf/qwen/qwen3.8-27b", "@cf/zai-org/glm-4.7-flash", "@cf/openai/gpt-oss-120b"],
         only_free: false, note: "10.000 neuron per hari gratis; butuh Account ID",
+    },
+    // Ditambahkan 2026-11-26 dari dokumentasi resmi dan uji endpoint (tanpa kunci / kunci salah).
+    Free {
+        name: "zai", kind: Kind::OpenAi, env: &["ZAI_API_KEY", "Z_AI_API_KEY"], keyless: false,
+        label: "Z.ai (GLM Flash)", base: "https://api.z.ai/api/paas/v4", list: None, check: None, public_list: false,
+        key_url: "https://z.ai/manage-apikey/apikey-list (Standard API Key, bukan Coding Plan)", key_hint: "",
+        models: &["glm-4.7-flash", "glm-4.5-flash"],
+        only_free: false, note: "gratis hanya glm-4.7-flash dan glm-4.5-flash; glm-5.3-flash dan *-flashx berbayar",
+    },
+    Free {
+        name: "bigmodel", kind: Kind::OpenAi, env: &["ZHIPU_API_KEY", "BIGMODEL_API_KEY"], keyless: false,
+        label: "Zhipu BigModel (Tiongkok)", base: "https://open.bigmodel.cn/api/paas/v4", list: None, check: None, public_list: false,
+        key_url: "https://bigmodel.cn/usercenter/proj-mgmt/apikeys", key_hint: "",
+        models: &["glm-4.7-flash", "glm-4.5-flash", "glm-4-flash-250414"],
+        only_free: false, note: "GLM Flash gratis; batas paralel menurut level akun",
+    },
+    Free {
+        name: "gemini", kind: Kind::Gemini, env: &["GEMINI_API_KEY", "GOOGLE_API_KEY"], keyless: false,
+        label: "Google AI Studio (Gemini)", base: "https://generativelanguage.googleapis.com/v1beta", list: None, check: None, public_list: false,
+        key_url: "https://aistudio.google.com/apikey", key_hint: "AIza",
+        models: &["gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-2.5-flash"],
+        only_free: false, note: "batas harian kecil (Flash sekitar 20 per hari); data tier gratis dipakai melatih model Google",
+    },
+    Free {
+        name: "kilo", kind: Kind::OpenAi, env: &["KILO_API_KEY"], keyless: true,
+        label: "Kilo Gateway (tanpa akun)", base: "https://ai-gateway.kilo.ai/api/v1", list: None,
+        check: Some("https://api.kilo.ai/api/profile"), public_list: true,
+        key_url: "https://app.kilo.ai (opsional; tanpa kunci pun jalan)", key_hint: "",
+        models: &["nvidia/nemotron-3-ultra-550b-a55b:free", "nvidia/nemotron-3.5-lightning:free", "kilo-auto/free"],
+        only_free: true, note: "model :free tanpa akun, 200 permintaan per jam per IP; sebagian melatih dari prompt",
+    },
+    Free {
+        name: "sambanova", kind: Kind::OpenAi, env: &["SAMBANOVA_API_KEY"], keyless: false,
+        label: "SambaNova Cloud", base: "https://api.sambanova.ai/v1", list: None, check: None, public_list: true,
+        key_url: "https://cloud.sambanova.ai/apis", key_hint: "",
+        models: &["gpt-oss-120b", "gemma-4-31B-it"],
+        only_free: false, note: "gratis selama tanpa metode bayar: 20 permintaan per hari per model",
+    },
+    Free {
+        name: "ovh", kind: Kind::OpenAi, env: &["OVH_AI_ENDPOINTS_ACCESS_TOKEN"], keyless: true,
+        label: "OVHcloud AI Endpoints (tanpa akun)", base: "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1", list: None, check: None, public_list: true,
+        key_url: "tanpa kunci gratis; kunci OVH berbayar (Public Cloud → AI Endpoints)", key_hint: "",
+        models: &["gpt-oss-120b", "Qwen3.6-27B", "Meta-Llama-3_3-70B-Instruct"],
+        only_free: false, note: "tanpa akun: 2 permintaan per menit per model; dukungan tool belum diperiksa",
+    },
+    Free {
+        name: "modelscope", kind: Kind::OpenAi, env: &["MODELSCOPE_API_KEY"], keyless: false,
+        label: "ModelScope (Tiongkok)", base: "https://api-inference.modelscope.cn/v1", list: None, check: None, public_list: true,
+        key_url: "https://modelscope.cn/my/myaccesstoken", key_hint: "ms-",
+        models: &["ZhipuAI/GLM-4.7-Flash", "Qwen/Qwen3.5-35B-A3B"],
+        only_free: false, note: "butuh akun Alibaba Cloud terverifikasi; non-komersial; tool belum diperiksa",
+    },
+    Free {
+        name: "llm7", kind: Kind::OpenAi, env: &["LLM7_API_KEY"], keyless: true,
+        label: "LLM7.io (tanpa akun)", base: "https://api.llm7.io/v1", list: None, check: None, public_list: true,
+        key_url: "https://dash.llm7.io (opsional)", key_hint: "",
+        models: &["codestral-latest"],
+        only_free: false, note: "tanpa akun, batas tidak dipublikasikan dan ketat; model berganti",
     },
 ];
 
@@ -196,7 +267,11 @@ fn pick(scr: &mut Screen, title: &str, help: &str, items: &[Item], filter: bool)
         for (n, &i) in shown.iter().enumerate().skip(top).take(WINDOW) {
             let it = &items[i];
             let mark = if n == sel { "›" } else { " " };
-            let num = if !filter && n < 9 { format!("{}. ", n + 1) } else { String::new() };
+            let num = match (filter, n < 9) {
+                (false, true) => format!("{}. ", n + 1),
+                (false, false) => "   ".into(),
+                (true, _) => String::new(),
+            };
             let note = if it.note.is_empty() { String::new() } else { format!("  {}", it.note) };
             lines.push((if n == sel { BOLD } else { "" }, format!("{mark} {num}{}{note}", it.label)));
         }
@@ -262,12 +337,17 @@ fn input(scr: &mut Screen, head: &[(&str, String)], prompt: &str, secret: bool) 
 
 // ---- jaringan ----
 
-fn get(url: &str, key: &str, cancel: &Cancel) -> Result<serde_json::Value, http::Fail> {
+fn get(url: &str, key: &str, kind: Kind, cancel: &Cancel) -> Result<serde_json::Value, http::Fail> {
     let (root, path) = match url.find("://").and_then(|i| url[i + 3..].find('/').map(|j| i + 3 + j)) {
         Some(i) => (&url[..i], url[i..].to_string()),
         None => (url, "/".to_string()),
     };
-    let headers = [("Authorization", format!("Bearer {key}")), ("Accept", "application/json".to_string())];
+    let mut headers = vec![("Accept", "application/json".to_string())];
+    match kind {
+        _ if key.is_empty() => {}
+        Kind::Gemini => headers.push(("x-goog-api-key", key.to_string())),
+        _ => headers.push(("Authorization", format!("Bearer {key}"))),
+    }
     let mut raw = String::new();
     http::request(&Req { base: root, method: "GET", path: &path, headers: &headers, body: "" }, cancel, &mut |l| {
         raw.push_str(l);
@@ -285,10 +365,13 @@ pub fn ids(v: &serde_json::Value) -> Vec<String> {
         .filter(|m| {
             let no_tools = m["supported_parameters"].as_array().is_some_and(|p| !p.iter().any(|x| x == "tools"))
                 || m["capabilities"]["function_calling"] == false
-                || m["is_deprecated"] == true;
+                || m["tools_calling"] == false
+                || m["is_deprecated"] == true
+                // Gemini: model embedding dan sejenisnya tidak bisa chat.
+                || m["supportedGenerationMethods"].as_array().is_some_and(|p| !p.iter().any(|x| x == "generateContent"));
             !no_tools
         })
-        .filter_map(|m| m["id"].as_str().or(m["name"].as_str()).map(String::from))
+        .filter_map(|m| m["id"].as_str().or(m["name"].as_str()).map(|s| s.strip_prefix("models/").unwrap_or(s).to_string()))
         .collect();
     out.sort();
     out.dedup();
@@ -298,19 +381,28 @@ pub fn ids(v: &serde_json::Value) -> Vec<String> {
 /// Periksa kunci (bila ada alamatnya) lalu ambil daftar model.
 fn models(f: &Free, base: &str, account: &str, key: &str, cancel: &Cancel) -> Result<Vec<String>, http::Fail> {
     let test = std::env::var("LLMY_SETUP_BASE").is_ok();
-    if let Some(c) = f.check.filter(|_| !test) {
-        get(c, key, cancel)?;
+    if let Some(c) = f.check.filter(|_| !test && !key.is_empty()) {
+        get(c, key, f.kind, cancel)?;
     }
     let url = match f.list.filter(|_| !test) {
         Some(l) => l.replace("{account}", account),
+        None if f.kind == Kind::Gemini => format!("{base}/models?pageSize=1000"),
         None => format!("{base}/models"),
     };
-    Ok(ids(&get(&url, key, cancel)?))
+    match get(&url, key, f.kind, cancel) {
+        Ok(v) => Ok(ids(&v)),
+        // Gemini membalas kunci salah dengan 400, bukan 401.
+        Err(mut e) if e.status == 400 && (e.msg.contains("API_KEY_INVALID") || e.msg.contains("API key not valid")) => {
+            e.status = 401;
+            Err(e)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Urutan tampil: yang disarankan dan tersedia dulu, lalu sisanya.
 pub fn order(f: &Free, fetched: &[String]) -> Vec<Item> {
-    let ok = |m: &str| !f.only_free || m.ends_with(":free");
+    let ok = |m: &str| !f.only_free || m.ends_with(":free") || m.ends_with("/free");
     let mut v: Vec<Item> = vec![];
     let have = |m: &str| fetched.is_empty() || fetched.iter().any(|x| x == m);
     for m in f.models.iter().filter(|m| have(m)) {
@@ -330,7 +422,7 @@ fn base_of(f: &Free, account: &str) -> String {
     f.base.replace("{account}", account)
 }
 
-fn valid_account(s: &str) -> bool {
+pub fn valid_account(s: &str) -> bool {
     s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
@@ -377,7 +469,7 @@ fn run(scr: &mut Screen) -> Result<Option<String>, String> {
         })
         .collect();
     loop {
-        let Some(i) = pick(scr, "Pasang provider LLM gratis", "↑↓ atau 1-7 pilih · Enter lanjut · Esc keluar", &items, false)? else {
+        let Some(i) = pick(scr, "Pasang provider LLM gratis", "↑↓ atau 1-9 pilih · Enter lanjut · Esc keluar", &items, false)? else {
             return Ok(None);
         };
         if let Some(msg) = provider(scr, &FREE[i])? {
@@ -416,16 +508,21 @@ fn provider(scr: &mut Screen, f: &Free) -> Result<Option<String>, String> {
     let cancel = Cancel::default();
     let fetched = loop {
         let keep = old.as_ref().and_then(|p| p.key.clone());
-        let prompt = match &keep {
-            Some(k) => format!("Kunci API (Enter = pakai {}): ", api::mask(k)),
-            None if f.key_hint.is_empty() => "Kunci API: ".into(),
-            None => format!("Kunci API ({}...): ", f.key_hint),
+        let from_env = f.env.iter().find(|e| crate::provider::env(e).is_some());
+        let prompt = match (&keep, from_env) {
+            (Some(k), _) => format!("Kunci API (Enter = pakai {}): ", api::mask(k)),
+            (None, Some(e)) => format!("Kunci API (Enter = pakai env {e}): "),
+            (None, None) if f.keyless => "Kunci API (Enter = tanpa kunci): ".into(),
+            (None, None) if f.key_hint.is_empty() => "Kunci API: ".into(),
+            (None, None) => format!("Kunci API ({}...): ", f.key_hint),
         };
         let Some(k) = input(scr, &head, &prompt, true)? else { return Ok(None) };
-        let key = match (k.is_empty(), keep) {
-            (false, _) => k,
-            (true, Some(k)) => k,
-            (true, None) => continue,
+        let key = match (k.is_empty(), keep, from_env) {
+            (false, _, _) => k,
+            (true, Some(k), _) => k,
+            (true, None, Some(e)) => crate::provider::env(e).unwrap_or_default(),
+            (true, None, None) if f.keyless => String::new(),
+            (true, None, None) => continue,
         };
         let mut h = head.clone();
         h.push((DIM, "  Memeriksa kunci dan mengambil daftar model…".into()));
@@ -449,6 +546,8 @@ fn provider(scr: &mut Screen, f: &Free) -> Result<Option<String>, String> {
     items.push(Item { label: "Ketik nama model lain…".into(), note: String::new() });
     let title = if list.is_empty() {
         format!("{} · pilih model (daftar saran llmy; kunci belum diperiksa)", f.label)
+    } else if key.is_empty() {
+        format!("{} · {} model · tanpa kunci", f.label, items.len() - 1)
     } else if f.public_list && f.check.is_none() {
         format!("{} · {} model · kunci baru diperiksa saat dipakai", f.label, items.len() - 1)
     } else {
@@ -470,7 +569,10 @@ fn provider(scr: &mut Screen, f: &Free) -> Result<Option<String>, String> {
         return Ok(None);
     };
     cfg = Config::load_strict()?;
-    cfg.providers.insert(f.name.into(), Profile { protocol: Kind::OpenAi, url: Some(base.clone()), key: Some(key), model: Some(model.clone()) });
+    // Kunci dari env tidak disalin ke api.json: llmy membacanya lagi dari env.
+    let from_env = !key.is_empty() && f.env.iter().any(|e| crate::provider::env(e).as_deref() == Some(key.as_str()));
+    let key = (!key.is_empty() && !from_env).then_some(key);
+    cfg.providers.insert(f.name.into(), Profile { protocol: f.kind, url: Some(base.clone()), key, model: Some(model.clone()) });
     if d == 0 {
         cfg.default = Some(f.name.into());
     }
@@ -523,7 +625,9 @@ mod tests {
     fn nama_profil_sah() {
         for f in &FREE {
             assert!(api::valid_name(f.name), "{}", f.name);
-            assert!(f.base.starts_with("https://") && !f.models.is_empty());
+            assert!(f.base.starts_with("https://") && !f.models.is_empty() && !f.env.is_empty());
         }
+        let names: std::collections::HashSet<_> = FREE.iter().map(|f| f.name).collect();
+        assert_eq!(names.len(), FREE.len());
     }
 }

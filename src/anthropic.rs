@@ -139,6 +139,10 @@ fn body(p: &Provider, msgs: &[Value], tools: &Value, mode: Mode) -> Value {
     if p.no_think {
         b["thinking"] = json!({"type":"disabled"});
     }
+    // Suhu tidak boleh bersama thinking.
+    if let (Some(t), false) = (p.temperature, p.think) {
+        b["temperature"] = json!(t);
+    }
     if official && has_fallback(&p.model) {
         b["fallbacks"] = json!("default");
     }

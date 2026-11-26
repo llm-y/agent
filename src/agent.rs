@@ -51,30 +51,41 @@ pub enum Cmd {
     Memory,
     /// Simpan langsung tanpa lewat model.
     Remember(String),
+    /// `/mode`: None = tampilkan.
+    Flow(Option<String>),
 }
 
 pub struct Agent {
     pub provider: Provider,
     pub perm: Perm,
     pub interactive: bool,
-    cwd: PathBuf,
-    cancel: Arc<Cancel>,
-    tx: Sender<Ev>,
-    msgs: Vec<Value>,
-    tools: Value,
+    pub(crate) cwd: PathBuf,
+    pub(crate) cancel: Arc<Cancel>,
+    pub(crate) tx: Sender<Ev>,
+    pub(crate) msgs: Vec<Value>,
+    pub(crate) tools: Value,
     /// Byte daftar tool, ikut terkirim di setiap permintaan.
     schema_bytes: usize,
     /// Token nyata dari balasan terakhir, dan jumlah pesan yang sudah tercakup.
-    used: u64,
-    counted: usize,
+    pub(crate) used: u64,
+    pub(crate) counted: usize,
     /// Byte per token, dikalibrasi dari balasan nyata.
     ratio: f64,
-    session: Option<Session>,
+    pub(crate) session: Option<Session>,
     /// Pemeriksaan setelah edit; kosong = mati.
-    checks: Vec<Check>,
+    pub(crate) checks: Vec<Check>,
     /// Boleh dijalankan tanpa tanya: ditulis sendiri oleh pengguna, atau dijawab "selalu".
     verify_ok: bool,
-    vmem: verify::Memory,
+    pub(crate) vmem: verify::Memory,
+    pub flow: Flow,
+    /// Model perencana mode BDI; None = model utama.
+    pub planner: Option<Provider>,
+    /// Model cadangan bila provider aktif kehabisan kuota atau bermasalah.
+    pub fallback: Vec<String>,
+    /// Isi asli file sebelum ditulis selama satu intention (None = belum ada), untuk rollback.
+    pub(crate) snap: Option<std::collections::BTreeMap<PathBuf, Option<String>>>,
+    /// Sedang menjalankan pekerja BDI: macet bukan error akhir.
+    pub(crate) sub: bool,
 }
 
 enum Step {
@@ -82,7 +93,37 @@ enum Step {
     Stop,
 }
 
-fn system_prompt(cwd: &std::path::Path, rules: &str, checks: &[Check]) -> String {
+/// Cara satu giliran berakhir; dipakai mode BDI untuk menilai komitmen.
+#[derive(Debug, PartialEq)]
+pub enum End {
+    /// Model berhenti memanggil tool.
+    Done,
+    /// Izin ditolak atau dibatalkan pengguna.
+    Stop,
+    /// Model macet: tool gagal beruntun, verifikasi tanpa kemajuan, atau jawaban terpotong.
+    Stuck(String),
+    /// Provider gagal.
+    Error(String),
+}
+
+/// Alur kerja: satu loop (bawaan) atau BDI.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Flow {
+    Loop,
+    Bdi,
+}
+
+impl Flow {
+    pub fn parse(s: &str) -> Option<Flow> {
+        match s {
+            "loop" | "satu" => Some(Flow::Loop),
+            "bdi" => Some(Flow::Bdi),
+            _ => None,
+        }
+    }
+}
+
+pub(crate) fn system_prompt(cwd: &std::path::Path, rules: &str, checks: &[Check]) -> String {
     let mut s = format!(
         "You are llmy, a coding agent working in the user's terminal.\n\
          Working directory: {}\nOS: {}\n\n\
@@ -117,6 +158,7 @@ impl Agent {
             provider, perm, interactive, cwd, cancel, tx, msgs: vec![], tools: tools::schema(), schema_bytes: 0,
             used: 0, counted: 0, ratio: 3.0, session: None,
             checks: vec![], verify_ok: false, vmem: verify::Memory::default(),
+            flow: Flow::Loop, planner: None, fallback: vec![], snap: None, sub: false,
         };
         // JSON skema + pembungkus per provider (perkiraan).
         a.schema_bytes = a.tools.to_string().len() * 11 / 10;
@@ -168,7 +210,7 @@ impl Agent {
         }
     }
 
-    fn push(&mut self, m: Value) {
+    pub(crate) fn push(&mut self, m: Value) {
         self.msgs.push(m);
         self.save(|s, m| s.push(&m[m.len() - 1]));
     }
@@ -192,11 +234,11 @@ impl Agent {
         }
     }
 
-    fn send(&self, e: Ev) {
+    pub(crate) fn send(&self, e: Ev) {
         let _ = self.tx.send(e);
     }
 
-    fn status(&self) {
+    pub(crate) fn status(&self) {
         self.send(Ev::Status {
             tokens: self.used,
             ctx: self.provider.ctx,
@@ -211,7 +253,14 @@ impl Agent {
         self.status();
         for cmd in rx {
             match cmd {
-                Cmd::User(s) => self.turn(s),
+                Cmd::User(s) => {
+                    if self.flow == Flow::Bdi {
+                        self.bdi(s);
+                    } else {
+                        self.turn(s);
+                    }
+                }
+                Cmd::Flow(f) => self.set_flow(f),
                 Cmd::Clear => {
                     self.msgs.truncate(1);
                     (self.used, self.counted) = (0, 0);
@@ -245,7 +294,7 @@ impl Agent {
     }
 
     /// Beri tahu bila isi percakapan meninggalkan komputer ini.
-    fn warn_remote(&self) {
+    pub(crate) fn warn_remote(&self) {
         if let Some(host) = self.provider.remote() {
             self.send(Ev::Info(format!("Model {}: pesan dan isi file yang dibaca dikirim ke {host}", self.provider.label())));
         }
@@ -433,7 +482,7 @@ impl Agent {
                 } else if let Some((proto, url)) = api::preset(name) {
                     cfg.providers.insert(name.clone(), api::Profile {
                         protocol: proto,
-                        url: Some(url.into()),
+                        url: Some(url),
                         key: None,
                         model,
                     });
@@ -472,7 +521,12 @@ impl Agent {
     }
 
     pub fn turn(&mut self, text: String) {
-        let wish = memory::wish(&text);
+        self.run(text);
+    }
+
+    /// Satu giliran: model -> tool -> model sampai model berhenti memanggil tool.
+    pub(crate) fn run(&mut self, text: String) -> End {
+        let wish = if self.sub { None } else { memory::wish(&text) };
         self.push(json!({"role":"user","content":text}));
         let mut history: Vec<String> = vec![];
         let mut fails = 0;
@@ -480,7 +534,8 @@ impl Agent {
         // menekan Esc, izin ditolak, atau panggilan yang sama diulang.
         loop {
             if self.cancel.is_set() {
-                return self.send(Ev::Info("Dihentikan.".into()));
+                self.send(Ev::Info("Dihentikan.".into()));
+                return End::Stop;
             }
             self.fit();
             let tx = self.tx.clone();
@@ -508,8 +563,15 @@ impl Agent {
                     // Simpan teks yang sudah terlihat agar riwayat sesuai layar.
                     if !partial.trim().is_empty() {
                         self.push(json!({"role":"assistant","content":partial}));
+                    } else if !self.cancel.is_set() && self.next_fallback(&e) {
+                        continue;
                     }
-                    return self.send(if self.cancel.is_set() { Ev::Info("Dihentikan.".into()) } else { Ev::Error(e) });
+                    if self.cancel.is_set() {
+                        self.send(Ev::Info("Dihentikan.".into()));
+                        return End::Stop;
+                    }
+                    self.send(Ev::Error(e.clone()));
+                    return End::Error(e);
                 }
             };
             if r.stripped {
@@ -523,11 +585,12 @@ impl Agent {
                     self.push(json!({"role":"assistant","content":r.content}));
                 }
                 self.counted = self.msgs.len();
-                return self.send(Ev::Error(if r.done_reason == "length" {
+                let e = if r.done_reason == "length" {
                     "Jawaban terpotong: batas token tercapai. Ketik \"lanjutkan\" untuk meneruskan.".into()
                 } else {
                     format!("Model menolak permintaan ini. {}", r.note.unwrap_or_default())
-                }));
+                };
+                return self.stuck(e);
             }
             if let Some(n) = &r.note {
                 self.send(Ev::Info(n.clone()));
@@ -568,7 +631,7 @@ impl Agent {
                     self.send(Ev::EndText);
                     self.call(&json!({"function":{"name":"remember","arguments":{"fact":fact,"scope":scope,"replaces":"none"}}}), &mut history);
                 }
-                return;
+                return End::Done;
             }
             let mut stop = false;
             let mut outs = vec![];
@@ -605,17 +668,81 @@ impl Agent {
             if self.vmem.streak >= verify::MAX_STREAK {
                 let n = self.vmem.streak;
                 self.vmem.streak = 0;
-                return self.send(Ev::Error(format!("Berhenti: verifikasi gagal {n} kali berturut-turut tanpa kemajuan. Ketik \"lanjutkan\" atau beri arahan lain.")));
+                return self.stuck(format!("Berhenti: verifikasi gagal {n} kali berturut-turut tanpa kemajuan. Ketik \"lanjutkan\" atau beri arahan lain."));
             }
             if fails >= MAX_FAILS && !stop {
-                return self.send(Ev::Error(format!("Berhenti: {fails} tool gagal berturut-turut. Ketik \"lanjutkan\" atau beri arahan lain.")));
+                return self.stuck(format!("Berhenti: {fails} tool gagal berturut-turut. Ketik \"lanjutkan\" atau beri arahan lain."));
             }
             if stop && !self.interactive {
-                return;
+                return End::Stop;
             }
             if stop {
-                return self.send(Ev::Info("Dihentikan. Beri arahan berikutnya.".into()));
+                if !self.sub {
+                    self.send(Ev::Info("Dihentikan. Beri arahan berikutnya.".into()));
+                }
+                return End::Stop;
             }
+        }
+    }
+
+    /// Macet: error akhir di mode loop; di pekerja BDI hanya catatan, karena orkestrator yang
+    /// memutuskan langkah berikutnya.
+    fn stuck(&mut self, e: String) -> End {
+        self.send(if self.sub { Ev::Info(e.clone()) } else { Ev::Error(e.clone()) });
+        End::Stuck(e)
+    }
+
+    /// Pindah ke model cadangan berikutnya bila kegagalan terakhir berupa kuota/server.
+    /// Model yang gagal pindah ke belakang antrean, jadi batas per menit bisa pulih.
+    pub(crate) fn next_fallback(&mut self, e: &str) -> bool {
+        self.provider.exhausted() && self.use_fallback(e)
+    }
+
+    /// Ganti model utama dengan cadangan berikutnya yang bisa dibuat.
+    pub(crate) fn use_fallback(&mut self, e: &str) -> bool {
+        if self.fallback.is_empty() {
+            return false;
+        }
+        let from = self.provider.label();
+        for _ in 0..self.fallback.len() {
+            let spec = self.fallback.remove(0);
+            self.fallback.push(from.clone());
+            if spec == from {
+                continue;
+            }
+            match self.provider.switch(&spec) {
+                Ok(p) => {
+                    let short: String = e.chars().take(120).collect();
+                    // Thinking terikat pada model yang membuatnya.
+                    strip_thinking(&mut self.msgs);
+                    self.provider = p;
+                    (self.used, self.counted) = (0, 0);
+                    self.send(Ev::Info(format!("{from} gagal ({short}); pindah ke cadangan {}.", self.provider.label())));
+                    self.warn_remote();
+                    self.status();
+                    return true;
+                }
+                Err(err) => self.send(Ev::Info(format!("Cadangan {spec} dilewati: {err}"))),
+            }
+        }
+        false
+    }
+
+    fn set_flow(&mut self, want: Option<String>) {
+        let Some(w) = want else {
+            let plan = self.planner.as_ref().map_or("model utama".into(), Provider::label);
+            let fb = if self.fallback.is_empty() { "-".into() } else { self.fallback.join(", ") };
+            return self.send(Ev::Info(format!(
+                "Alur: {}. Perencana BDI: {plan}. Cadangan: {fb}.\n/mode loop: satu loop, satu model (bawaan)\n/mode bdi: perencana memecah tugas, tiap tujuan dikerjakan pekerja dengan context baru, diverifikasi, dan dikembalikan bila buntu",
+                if self.flow == Flow::Bdi { "bdi" } else { "loop" }
+            )));
+        };
+        match Flow::parse(w.trim()) {
+            Some(f) => {
+                self.flow = f;
+                self.send(Ev::Info(format!("Alur sekarang {}.", w.trim())));
+            }
+            None => self.send(Ev::Error(format!("Alur tidak dikenal: {w} (loop atau bdi)"))),
         }
     }
 
@@ -708,6 +835,9 @@ impl Agent {
             (Action::Write { path, new, .. }, false) => Some((path.clone(), new.clone())),
             _ => None,
         };
+        if let (Some(snap), Some((path, _))) = (&mut self.snap, &written) {
+            snap.entry(path.clone()).or_insert_with(|| std::fs::read_to_string(path).ok());
+        }
         let mut o = tools::run(p, &self.cwd, self.provider.ctx, &self.cancel);
         if o.ok
             && let Some((path, new)) = written
@@ -724,7 +854,7 @@ impl Agent {
 
     /// Jalankan pemeriksaan untuk file yang diubah di langkah ini. Hasilnya untuk model,
     /// atau None bila tidak ada yang dijalankan.
-    fn verify(&mut self) -> Option<String> {
+    pub(crate) fn verify(&mut self) -> Option<String> {
         let changed = self.vmem.changed();
         let run: Vec<(usize, String)> = self.checks.iter().enumerate().filter_map(|(i, c)| c.command(&changed).map(|cmd| (i, cmd))).collect();
         if run.is_empty() || self.cancel.is_set() {
@@ -790,6 +920,7 @@ impl Agent {
             return Some(format!("\n\n[llmy check passed: {}]", ran.join("; ")));
         }
         self.vmem.failed(weight);
+        self.vmem.errors = failed.join("\n\n");
         let n = self.vmem.streak;
         self.send(Ev::ToolDone { ok: false, summary: format!("gagal ({n}/{}){missing}", verify::MAX_STREAK) });
         Some(format!("\n\n[llmy check FAILED after this step. Fix these errors:]\n{}", failed.join("\n\n")))
@@ -892,7 +1023,7 @@ fn size(m: &Value) -> usize {
     m.to_string().len() - skip("blocks") - skip("parts") - skip("reasoning")
 }
 
-fn strip_thinking(msgs: &mut [Value]) {
+pub(crate) fn strip_thinking(msgs: &mut [Value]) {
     anthropic::strip_thinking(msgs);
     gemini::strip_thinking(msgs);
 }

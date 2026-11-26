@@ -1,6 +1,7 @@
 mod agent;
 mod anthropic;
 mod api;
+mod bdi;
 mod cancel;
 mod detect;
 mod editor;
@@ -71,6 +72,12 @@ Opsi:
       --verify <cmd>   periksa setelah edit dengan perintah ini (env LLMY_VERIFY); off mematikan.
                        Bawaan: cargo check, go build/vet, tsc, atau py_compile menurut proyek
                        (ditanya seperti bash, kecuali --auto atau --allow bash)
+      --mode <alur>    loop (bawaan): satu loop, satu model. bdi: perencana memecah tugas,
+                       tiap tujuan dikerjakan pekerja dengan context baru, diverifikasi, dan
+                       dikembalikan bila buntu (env LLMY_MODE; interaktif: /mode)
+      --plan <model>   model perencana mode bdi, mis. groq/openai/gpt-oss-120b (env LLMY_PLAN)
+      --fallback <daftar>  model cadangan, dipisah koma: dipakai bergiliran bila kuota habis
+                       atau server bermasalah (env LLMY_FALLBACK)
       --auto           mode auto: setujui semua tanpa tanya (sama dengan --allow all), kecuali
                        path di luar folder kerja, di .git, atau file rahasia. Interaktif:
                        /auto atau Shift+Tab untuk menyalakan/mematikan
@@ -95,6 +102,9 @@ struct Opts {
     save: bool,
     list: bool,
     verify: Option<String>,
+    flow: agent::Flow,
+    plan: Option<String>,
+    fallback: Vec<String>,
 }
 
 fn default_model() -> String {
@@ -112,7 +122,15 @@ fn default_model() -> String {
 }
 
 fn parse() -> Result<(Opts, impl FnOnce() -> Result<Provider, String>), String> {
-    let mut o = Opts { perm: Perm::default(), prompt: None, resume: None, save: true, list: false, verify: None };
+    let cfg = api::Config::load();
+    let mut o = Opts {
+        perm: Perm::default(), prompt: None, resume: None, save: true, list: false, verify: None,
+        flow: agent::Flow::Loop, plan: env("LLMY_PLAN").or(cfg.plan), fallback: cfg.fallback,
+    };
+    let mut flow = env("LLMY_MODE").or(cfg.mode).unwrap_or("loop".into());
+    if let Some(f) = env("LLMY_FALLBACK") {
+        o.fallback = api::split_list(&f);
+    }
     let mut model = env("LLMY_MODEL").unwrap_or_else(default_model);
     let mut ctx = env("LLMY_CTX");
     let mut tools = env("LLMY_TOOLS").unwrap_or("auto".into());
@@ -149,6 +167,9 @@ fn parse() -> Result<(Opts, impl FnOnce() -> Result<Provider, String>), String> 
             }
             "-p" | "--print" => o.prompt = Some(val()?),
             "--verify" => o.verify = Some(val()?),
+            "--mode" => flow = val()?,
+            "--plan" => o.plan = Some(val()?),
+            "--fallback" => o.fallback = api::split_list(&val()?),
             "--auto" => o.perm.all.store(true, std::sync::atomic::Ordering::Relaxed),
             "--allow" => {
                 for s in val()?.split(',') {
@@ -164,6 +185,10 @@ fn parse() -> Result<(Opts, impl FnOnce() -> Result<Provider, String>), String> 
             }
             _ => return Err(format!("opsi tidak dikenal: {a} (lihat --help)")),
         }
+    }
+    o.flow = agent::Flow::parse(&flow).ok_or(format!("--mode tidak mengenal `{flow}` (loop atau bdi)"))?;
+    if o.plan.as_deref() == Some("off") {
+        o.plan = None;
     }
     let ctx = ctx.map(|c| c.parse().ok().filter(|n| *n >= 4096).ok_or("ctx harus angka >= 4096")).transpose()?;
     let tools = Tools::parse(&tools).ok_or(format!("--tools tidak mengenal `{tools}` (auto, native, atau text)"))?;
@@ -192,6 +217,7 @@ fn main() {
         return list(session.as_ref());
     }
     let provider = provider().unwrap_or_else(|e| die(&e));
+    let planner = o.plan.as_deref().map(|p| provider.switch(p).unwrap_or_else(|e| die(&format!("--plan: {e}"))));
     let cancel = Arc::new(Cancel::default());
     let (tx, rx) = channel();
     let interactive = o.prompt.is_none();
@@ -211,9 +237,10 @@ fn main() {
         }
     });
     let auto = o.perm.all.clone();
-    let agent = Agent::new(provider, o.perm, interactive, cwd.clone(), cancel.clone(), tx.clone())
+    let mut agent = Agent::new(provider, o.perm, interactive, cwd.clone(), cancel.clone(), tx.clone())
         .with_verify(o.verify)
         .with_session(session, history);
+    (agent.flow, agent.planner, agent.fallback) = (o.flow, planner, o.fallback);
     let (ctx, crx) = channel();
     std::thread::spawn(move || agent.serve(crx));
     match o.prompt {

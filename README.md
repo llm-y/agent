@@ -15,8 +15,14 @@ mode auto (`--auto`, `/auto`, Shift+Tab).
 Setelah edit, llmy sendiri menjalankan pemeriksaan proyek (`cargo check`, `go build`, `tsc`, `py_compile`,
 atau `--verify <perintah>`) dan memberikan galatnya ke model. Isi file yang sudah gagal ditolak bila ditulis lagi.
 
-Provider gratis (Groq, Cerebras, OpenRouter `:free`, Mistral, Cohere, NVIDIA NIM, Cloudflare Workers AI)
-bisa dipasang lewat menu: `llmy setup`.
+Provider gratis (Groq, Cerebras, OpenRouter `:free`, Mistral, Cohere, NVIDIA NIM, Cloudflare Workers AI,
+Z.ai dan Zhipu BigModel (GLM Flash), Google AI Studio, Kilo, SambaNova, OVHcloud, ModelScope, LLM7) bisa
+dipasang lewat menu `llmy setup`, atau cukup lewat env kuncinya (`GROQ_API_KEY`, `ZAI_API_KEY`, ...).
+`--fallback a,b` berpindah ke model lain saat kuota habis.
+
+Alur bawaan: satu loop, satu model. `--mode bdi` membagi kerja: perencana (bisa model lain, `--plan`)
+memecah tugas, tiap tujuan dikerjakan pekerja dengan context baru, llmy memverifikasi, dan file
+dikembalikan bila buntu.
 
 Instalasi dan manual: <https://ll.my.id>
 
