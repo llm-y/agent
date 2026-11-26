@@ -137,14 +137,14 @@ pub const FREE: [Free; 15] = [
         label: "SambaNova Cloud", base: "https://api.sambanova.ai/v1", list: None, check: None, public_list: true,
         key_url: "https://cloud.sambanova.ai/apis", key_hint: "",
         models: &["gpt-oss-120b", "gemma-4-31B-it"],
-        only_free: false, note: "gratis selama tanpa metode bayar: 20 permintaan per hari per model",
+        only_free: false, note: "kunci baru ditolak (402) sampai metode bayar ditambahkan (diuji 2026-11-27)",
     },
     Free {
         name: "ovh", kind: Kind::OpenAi, env: &["OVH_AI_ENDPOINTS_ACCESS_TOKEN"], keyless: true,
         label: "OVHcloud AI Endpoints (tanpa akun)", base: "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1", list: None, check: None, public_list: true,
         key_url: "tanpa kunci gratis; kunci OVH berbayar (Public Cloud → AI Endpoints)", key_hint: "",
         models: &["gpt-oss-120b", "Qwen3.6-27B", "Meta-Llama-3_3-70B-Instruct"],
-        only_free: false, note: "tanpa akun: 2 permintaan per menit per model; dukungan tool belum diperiksa",
+        only_free: false, note: "tanpa akun: server membalas 429 dengan batas 1 permintaan per tahun (diuji 2026-11-27); kunci OVH berbayar",
     },
     Free {
         name: "modelscope", kind: Kind::OpenAi, env: &["MODELSCOPE_API_KEY"], keyless: false,

@@ -325,12 +325,18 @@ impl Provider {
         (!http::is_local(&self.base)).then_some(&self.base)
     }
 
+    /// Env tempat kunci profil ini dibaca: provider gratis memakai env miliknya (GROQ_API_KEY, ...).
+    fn key_name(&self) -> &'static str {
+        let free = crate::setup::find(&self.profile).filter(|_| !api::is_builtin(&self.profile));
+        free.map_or(env_key_name(self.kind), |f| f.env[0])
+    }
+
     pub fn headers(&self) -> Result<Vec<(&'static str, String)>, String> {
         if self.kind == Kind::Ollama {
             return Ok(vec![]);
         }
         let free = crate::setup::find(&self.profile).filter(|_| !api::is_builtin(&self.profile));
-        let name = free.map_or(env_key_name(self.kind), |f| f.env[0]);
+        let name = self.key_name();
         let h = self.api_key.as_ref().map(|k| match self.kind {
             Kind::Anthropic if self.auth_bearer => ("Authorization", format!("Bearer {k}")),
             Kind::Anthropic => ("x-api-key", k.clone()),
@@ -504,16 +510,14 @@ impl Provider {
     }
 
     fn explain(&self, e: Fail) -> String {
-        let hint = match (e.status, self.kind) {
-            (401 | 403, _) if self.kind != Kind::Ollama && self.key_withheld() => " (kunci tidak dikirim lewat http; pakai https atau terowongan ssh)",
-            _ if !self.text_tools && detect::refuses(&e) => " (coba --tools text)",
-            (401 | 403, Kind::Anthropic) => " (periksa ANTHROPIC_API_KEY atau /api)",
-            (401 | 403, Kind::OpenAi) => " (periksa OPENAI_API_KEY atau /api)",
-            (401 | 403, Kind::Gemini) => " (periksa GEMINI_API_KEY atau /api)",
-            (404, _) => " (periksa nama model: /model)",
-            _ => "",
+        let hint: String = match (e.status, self.kind) {
+            (401 | 403, _) if self.kind != Kind::Ollama && self.key_withheld() => " (kunci tidak dikirim lewat http; pakai https atau terowongan ssh)".into(),
+            _ if !self.text_tools && detect::refuses(&e) => " (coba --tools text)".into(),
+            (401 | 403, Kind::Anthropic | Kind::OpenAi | Kind::Gemini) => format!(" (periksa {} atau /api)", self.key_name()),
+            (404, _) => " (periksa nama model: /model)".into(),
+            _ => String::new(),
         };
-        e.msg + hint
+        e.msg + &hint
     }
 
     /// Ambil batas model dari API sekali; gagal bukan masalah, pakai bawaan.
@@ -599,6 +603,20 @@ mod tests {
         assert_eq!(split("qwen3.5:9b"), (Kind::Ollama, "qwen3.5:9b"));
         assert_eq!(split("hf.co/x/y"), (Kind::Ollama, "hf.co/x/y"));
         assert!(Provider::new("openai/", None, None).is_err());
+    }
+
+    #[test]
+    fn petunjuk_401_menyebut_env_kunci_profil() {
+        let f = |spec: &str| {
+            let (name, model) = spec.split_once('/').unwrap();
+            let mut sess = BTreeMap::new();
+            sess.insert(name.into(), api::Profile { protocol: Kind::OpenAi, url: None, key: Some("kunci-uji-123456".into()), model: Some(model.into()) });
+            let p = Provider::with_options(name, None, None, None, sess).unwrap();
+            p.explain(Fail { status: 401, msg: "HTTP 401: ditolak".into(), retry_after: None, no_retry: false, location: None })
+        };
+        assert!(f("modelscope/ZhipuAI/GLM-4.7-Flash").ends_with("(periksa MODELSCOPE_API_KEY atau /api)"));
+        assert!(f("groq/openai/gpt-oss-120b").contains("GROQ_API_KEY"));
+        assert!(f("openai/gpt-x").contains("OPENAI_API_KEY"));
     }
 
     #[test]
