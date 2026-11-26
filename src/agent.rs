@@ -662,6 +662,8 @@ impl Agent {
                 self.ratio = (sent as f64 / r.tokens as f64).clamp(1.2, 4.5);
             }
             self.used = r.tokens;
+            self.stat.calls += 1;
+            self.stat.tokens_total += r.tokens;
             self.status();
             let mut m = json!({"role":"assistant","content":r.content});
             if !r.thinking.is_empty() {
