@@ -188,7 +188,7 @@ fn markdown(line: &str, in_code: &mut bool) -> Vec<Span> {
 }
 
 /// Sebagian pengelola sesi (mis. `s`) melaporkan 0x0 sebelum klien tersambung.
-fn size((w, h): (u16, u16)) -> (usize, usize) {
+pub fn size((w, h): (u16, u16)) -> (usize, usize) {
     let or = |n: u16, d: usize| if n == 0 { d } else { n as usize };
     (or(w, 80).max(20), or(h, 24).max(10))
 }

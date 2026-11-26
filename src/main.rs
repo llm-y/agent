@@ -14,6 +14,7 @@ mod perm;
 mod provider;
 mod rules;
 mod session;
+mod setup;
 mod sys;
 mod text;
 mod tools;
@@ -43,6 +44,8 @@ Pakai:
   llmy [opsi]              mode interaktif
   llmy [opsi] -p <prompt>  sekali jalan (stdin ikut dibaca bila dipipa)
   llmy api [perintah]      atur API beberapa provider (set, list, use, remove)
+  llmy setup               pasang provider gratis lewat menu: Groq, Cerebras, OpenRouter (:free),
+                           Mistral, Cohere, NVIDIA NIM, Cloudflare Workers AI
 
 Opsi:
   -m, --model <nama>   model (env LLMY_MODEL, bawaan qwen3.5:9b atau profil bawaan)
@@ -175,6 +178,10 @@ fn parse() -> Result<(Opts, impl FnOnce() -> Result<Provider, String>), String> 
 
 fn main() {
     let raw_args: Vec<String> = std::env::args().collect();
+    let sub = |i: usize| raw_args.get(i).map(String::as_str);
+    if sub(1) == Some("setup") || (sub(1) == Some("api") && sub(2) == Some("setup")) {
+        std::process::exit(setup::cli());
+    }
     if raw_args.get(1).map(String::as_str) == Some("api") {
         std::process::exit(api::cli(&raw_args[2..]));
     }

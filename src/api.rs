@@ -37,11 +37,9 @@ pub fn preset(name: &str) -> Option<(Kind, &'static str)> {
         "openai" => (Kind::OpenAi, openai::BASE),
         "gemini" => (Kind::Gemini, gemini::BASE),
         "deepseek" => (Kind::OpenAi, "https://api.deepseek.com"),
-        "openrouter" => (Kind::OpenAi, "https://openrouter.ai/api/v1"),
-        "groq" => (Kind::OpenAi, "https://api.groq.com/openai/v1"),
-        "mistral" => (Kind::OpenAi, "https://api.mistral.ai/v1"),
         "xai" => (Kind::OpenAi, "https://api.x.ai/v1"),
-        _ => return None,
+        // Provider gratis dari `llmy setup`; Cloudflare butuh Account ID di alamatnya.
+        _ => return crate::setup::find(name).filter(|f| !f.base.contains('{')).map(|f| (Kind::OpenAi, f.base)),
     })
 }
 
