@@ -27,10 +27,6 @@ impl Perm {
             Action::Write { .. } if p.memory && self.allow_memory => true,
             Action::Write { .. } => self.allow_edit && !p.guarded,
             Action::Bash { cmd, .. } => self.allow_bash || self.bash_exact.contains(cmd),
-            // Pencarian dan akses data: diizinkan otomatis
-            Action::Search { .. } | Action::Openalex { .. } | Action::Doi { .. } | Action::Scopus { .. } | Action::Github { .. } | Action::Firecrawl { .. } | Action::Brightdata { .. } | Action::Browserbase { .. } => true,
-            // Head/tail: diizinkan sebagai baca
-            Action::Head { .. } | Action::Tail { .. } => !p.guarded,
         }
     }
 
@@ -42,10 +38,6 @@ impl Perm {
             Action::Read { .. } | Action::Grep { .. } => None,
             Action::Write { .. } => Some("Ya, selalu untuk edit di folder ini selama sesi"),
             Action::Bash { .. } => Some("Ya, selalu untuk perintah persis ini selama sesi"),
-            // Pencarian dan akses data: tidak menawarkan opsi "selalu"
-            Action::Search { .. } | Action::Openalex { .. } | Action::Doi { .. } | Action::Scopus { .. } | Action::Github { .. } | Action::Firecrawl { .. } | Action::Brightdata { .. } | Action::Browserbase { .. } => None,
-            // Head/tail: tidak menawarkan opsi
-            Action::Head { .. } | Action::Tail { .. } => None,
         }
     }
 
@@ -57,11 +49,7 @@ impl Perm {
             Action::Write { .. } => self.allow_edit = true,
             Action::Bash { cmd, .. } => {
                 self.bash_exact.insert(cmd.clone());
-            },
-            // Pencarian dan akses data: tidak mengubah izin
-            Action::Search { .. } | Action::Openalex { .. } | Action::Doi { .. } | Action::Scopus { .. } | Action::Github { .. } | Action::Firecrawl { .. } | Action::Brightdata { .. } | Action::Browserbase { .. } => {},
-            // Head/tail: tidak mengubah izin
-            Action::Head { .. } | Action::Tail { .. } => {},
+            }
         }
     }
 }
