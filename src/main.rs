@@ -9,6 +9,7 @@ mod gemini;
 mod grep;
 mod http;
 mod memory;
+mod metrics;
 mod ollama;
 mod openai;
 mod perm;
@@ -46,6 +47,7 @@ Pakai:
   llmy [opsi]              mode interaktif
   llmy [opsi] -p <prompt>  sekali jalan (stdin ikut dibaca bila dipipa)
   llmy api [perintah]      atur API beberapa provider (set, list, use, remove)
+  llmy stats               ringkasan metrik lokal per giliran (LLMY_METRICS=off mematikan)
   llmy setup               pasang provider gratis lewat menu: Groq, Cerebras, OpenRouter (:free),
                            Mistral, Cohere, NVIDIA NIM, Cloudflare Workers AI
 
@@ -211,6 +213,9 @@ fn main() {
     let sub = |i: usize| raw_args.get(i).map(String::as_str);
     if sub(1) == Some("setup") || (sub(1) == Some("api") && sub(2) == Some("setup")) {
         std::process::exit(setup::cli());
+    }
+    if sub(1) == Some("stats") {
+        std::process::exit(metrics::cli());
     }
     if raw_args.get(1).map(String::as_str) == Some("api") {
         std::process::exit(api::cli(&raw_args[2..]));

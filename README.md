@@ -26,6 +26,11 @@ Alur bawaan: satu loop, satu model. `--mode bdi` membagi kerja: perencana (bisa 
 memecah tugas, tiap tujuan dikerjakan pekerja dengan context baru, llmy memverifikasi, dan file
 dikembalikan bila buntu. `/undo` mengembalikan file yang diubah giliran terakhir, termasuk lewat `bash`.
 
+Harness: saat model menyatakan selesai, llmy menjalankan uji proyek dan mengembalikan kegagalannya ke model;
+galat pemeriksaan disertai potongan kode di lokasinya (16 tugas, qwen3.5:9b: 33/48 → 45/48 benar); peta proyek
+opsional (`LLMY_MAP=on`); `edit` toleran indentasi;
+argumen tool yang cacat diperbaiki; sub-agent baca-saja berjalan paralel; `llmy stats` meringkas metrik lokal.
+
 Instalasi dan manual: <https://ll.my.id>
 
 ```sh

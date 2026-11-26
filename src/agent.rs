@@ -99,6 +99,24 @@ pub struct Agent {
     note: Option<String>,
     /// Pemindaian folder terakhir, untuk melihat file yang diubah `bash`.
     pub(crate) tree: Option<track::Tree>,
+    /// Uji proyek di akhir giliran, dan keadaan file terakhir yang lulus.
+    gates: Vec<verify::Gate>,
+    gate_ok: Option<u64>,
+    /// File yang diubah selama sesi, untuk catatan state di awal giliran.
+    touched: std::collections::BTreeSet<PathBuf>,
+    /// Sub-agent baca-saja: hanya read/grep/head/tail.
+    readonly: bool,
+    /// Metrik giliran yang sedang berjalan.
+    pub(crate) stat: crate::metrics::Turn,
+    /// Peta proyek di pesan pertama dan catatan state (`LLMY_MAP=on`). Bawaan mati: ablasi E09 tidak
+    /// menunjukkan manfaat (gerbang 45/48 vs + konteks 43/48, McNemar p = 0,69), padahal menambah token.
+    pub map: bool,
+}
+
+enum GateEnd {
+    Pass,
+    Skip,
+    Fail(String),
 }
 
 /// Giliran yang bisa dibatalkan dengan `/undo`.
@@ -177,7 +195,8 @@ impl Agent {
             used: 0, counted: 0, ratio: 3.0, session: None,
             checks: vec![], verify_ok: false, vmem: verify::Memory::default(),
             flow: Flow::Loop, planner: None, fallback: vec![], snap: None, sub: false,
-            subagent: None, turn_log: BTreeMap::new(), undo: vec![], note: None, tree: None,
+            subagent: None, turn_log: BTreeMap::new(), undo: vec![], note: None, tree: None, gates: vec![], gate_ok: None,
+            touched: Default::default(), stat: Default::default(), readonly: false, map: crate::provider::env("LLMY_MAP").is_some_and(|v| v == "on"),
         };
         // JSON skema + pembungkus per provider (perkiraan).
         a.schema_bytes = a.tools.to_string().len() * 11 / 10;
@@ -190,6 +209,7 @@ impl Agent {
     /// build bisa menjalankan kode proyek (build.rs, skrip npm).
     pub fn with_verify(mut self, custom: Option<String>) -> Self {
         self.checks = verify::detect(&self.cwd, custom.as_deref());
+        self.gates = verify::gates(&self.cwd, custom.as_deref());
         self.verify_ok = custom.is_some();
         let m = json!({"role":"system","content":system_prompt(&self.cwd, &rules::load(&self.cwd).text, &self.checks)});
         self.msgs[0] = m;
@@ -240,7 +260,7 @@ impl Agent {
         for m in &self.msgs[from..] {
             let Some(t) = m["content"].as_str().filter(|t| !t.trim().is_empty()) else { continue };
             match m["role"].as_str() {
-                Some("user") => self.send(Ev::User(t.into())),
+                Some("user") => self.send(Ev::User(user_part(t).into())),
                 Some("assistant") => {
                     self.send(Ev::Text(t.into()));
                     self.send(Ev::EndText);
@@ -272,16 +292,25 @@ impl Agent {
         self.status();
         for cmd in rx {
             match cmd {
-                Cmd::User(mut s) => {
-                    if let Some(n) = self.note.take() {
-                        s = format!("{n}\n\n{s}");
-                    }
+                Cmd::User(s) => {
                     self.turn_log.clear();
-                    if self.flow == Flow::Bdi {
+                    self.stat = crate::metrics::Turn { start: Some(std::time::Instant::now()), ..Default::default() };
+                    let s = self.context(s);
+                    let end = if self.flow == Flow::Bdi {
                         self.bdi(s);
+                        "bdi".to_string()
                     } else {
-                        self.turn(s);
-                    }
+                        match self.run(s) {
+                            End::Done => "Done".into(),
+                            End::Stop => "Stop".into(),
+                            End::Stuck(_) => "Stuck".into(),
+                            End::Error(_) => "Error".into(),
+                        }
+                    };
+                    let flow = if self.flow == Flow::Bdi { "bdi" } else { "loop" };
+                    self.stat.loose_edits = tools::LOOSE.swap(0, std::sync::atomic::Ordering::Relaxed);
+                    crate::metrics::write(&self.stat, &self.provider.label(), flow, &end, self.used);
+                    self.touched.extend(self.turn_log.keys().cloned());
                     if !self.turn_log.is_empty() {
                         self.undo.push(std::mem::take(&mut self.turn_log));
                         if self.undo.len() > UNDO_MAX {
@@ -550,16 +579,14 @@ impl Agent {
         }
     }
 
-    pub fn turn(&mut self, text: String) {
-        self.run(text);
-    }
-
     /// Satu giliran: model -> tool -> model sampai model berhenti memanggil tool.
     pub(crate) fn run(&mut self, text: String) -> End {
-        let wish = if self.sub { None } else { memory::wish(&text) };
+        let wish = if self.sub { None } else { memory::wish(user_part(&text)) };
         self.push(json!({"role":"user","content":text}));
         let mut history: Vec<String> = vec![];
         let mut fails = 0;
+        // Uji yang gagal dikembalikan ke model paling banyak dua kali per giliran.
+        let mut gate_left = 2;
         // Tanpa batas langkah: giliran berakhir bila model berhenti memanggil tool, pengguna
         // menekan Esc, izin ditolak, atau panggilan yang sama diulang.
         loop {
@@ -659,6 +686,18 @@ impl Agent {
                 self.send(Ev::Info(format!("  {}", t.replace('\n', "\n  "))));
             }
             if r.calls.is_empty() {
+                // Model menyatakan selesai: uji proyek dulu.
+                if !self.sub && !self.cancel.is_set() {
+                    match self.gate() {
+                        GateEnd::Fail(fb) if gate_left > 0 => {
+                            gate_left -= 1;
+                            self.push(json!({"role":"user","content":fb}));
+                            continue;
+                        }
+                        GateEnd::Fail(_) => return self.stuck("Berhenti: uji proyek masih gagal setelah dua kali diperbaiki. Ketik \"lanjutkan\" atau beri arahan lain.".into()),
+                        GateEnd::Pass | GateEnd::Skip => {}
+                    }
+                }
                 if r.content.trim().is_empty() {
                     self.send(Ev::Info("Model tidak memberi jawaban.".into()));
                 }
@@ -675,8 +714,32 @@ impl Agent {
             let mut stop = false;
             let mut outs = vec![];
             let mut last_write = None;
+            // Beberapa task baca-saja dalam satu jawaban: jalankan bersamaan.
+            let mut pre: std::collections::HashMap<usize, Output> = Default::default();
+            if !self.sub {
+                let ro: Vec<(usize, String, Vec<String>)> = r.calls.iter().enumerate().filter_map(|(i, c)| {
+                    if c["function"]["name"] != "task" {
+                        return None;
+                    }
+                    let a = match &c["function"]["arguments"] {
+                        Value::String(s) => tools::repair_args(s)?,
+                        v => v.clone(),
+                    };
+                    match tools::prepare("task", &a, &self.cwd).ok()?.action {
+                        Action::Task { task, files, readonly: true } => Some((i, task, files)),
+                        _ => None,
+                    }
+                }).collect();
+                if ro.len() >= 2 {
+                    let idx: Vec<usize> = ro.iter().map(|x| x.0).collect();
+                    let outs = self.readonly_tasks(ro.into_iter().map(|(_, t, f)| (t, f)).collect());
+                    pre = idx.into_iter().zip(outs).collect();
+                }
+            }
             for (i, c) in r.calls.iter().enumerate() {
-                let out = if stop {
+                let out = if let Some(o) = pre.remove(&i) {
+                    o
+                } else if stop {
                     Output::err("dilewati karena giliran dihentikan")
                 } else {
                     let before = self.vmem.pending();
@@ -688,6 +751,8 @@ impl Agent {
                     o
                 };
                 fails = if out.ok { 0 } else { fails + 1 };
+                self.stat.steps += 1;
+                self.stat.tool_fail += u32::from(!out.ok);
                 outs.push(out);
             }
             // Hasil verifikasi menempel pada hasil edit terakhir: pasangan tool_calls tetap utuh.
@@ -767,6 +832,33 @@ impl Agent {
         false
     }
 
+    /// Catatan deterministik di depan pesan pengguna (context engineering): peta proyek di pesan
+    /// pertama, lalu file yang sudah diubah dan status pemeriksaan terakhir. Riwayat hanya bertambah,
+    /// jadi catatan lama tidak diubah.
+    fn context(&mut self, text: String) -> String {
+        let mut pre = vec![];
+        // BDI: perencana membaca peta sendiri; yang dibawa hanya catatan /undo.
+        let bdi = self.flow == Flow::Bdi;
+        if let Some(n) = self.note.take() {
+            pre.push(n);
+        }
+        if self.map && self.msgs.len() == 1 && !bdi {
+            let m = crate::bdi::repo_map(&self.cwd);
+            if m != "(none)" {
+                pre.push(format!("[Project map from llmy: files with their definitions and line numbers. Open what you need with read (offset, or symbol); do not guess file contents.]\n{}", m.trim_end()));
+            }
+        }
+        if !self.touched.is_empty() && !bdi && self.map {
+            let files: Vec<String> = self.touched.iter().take(20).map(|p| p.strip_prefix(&self.cwd).unwrap_or(p).display().to_string().replace('\\', "/")).collect();
+            let check = if self.checks.is_empty() { String::new() } else if self.vmem.clean() { "; last check passed".into() } else { "; last check FAILED".into() };
+            pre.push(format!("[llmy state: files changed earlier in this session: {}{check}]", files.join(", ")));
+        }
+        if pre.is_empty() {
+            return text;
+        }
+        format!("{}{USER_MARK}{text}", pre.join("\n\n"))
+    }
+
     /// Catat isi file sebelum berubah: untuk `/undo` dan rollback intention BDI.
     pub(crate) fn record(&mut self, path: &std::path::Path, before: Option<String>) {
         if let Some(s) = &mut self.snap {
@@ -813,6 +905,7 @@ impl Agent {
             return (Output::err("task is not available inside a subtask; do the work yourself"), Step::Continue);
         }
         let first: String = task.trim().lines().next().unwrap_or("").chars().take(100).collect();
+        self.stat.subagents += 1;
         self.send(Ev::Info(format!("▶ sub-agent: {first}")));
         let mut u = format!("Task from the main agent:\n{}\n", task.trim());
         if !files.is_empty() {
@@ -853,6 +946,65 @@ impl Agent {
         (Output { text, summary: String::new(), ok }, step)
     }
 
+    /// Sub-agent baca-saja, paralel: masing-masing Agent sendiri di thread sendiri, context baru,
+    /// hanya tool baca. Aman dijalankan bersamaan karena tidak ada yang menulis.
+    fn readonly_tasks(&mut self, jobs: Vec<(String, Vec<String>)>) -> Vec<Output> {
+        let n = jobs.len();
+        let rules = rules::load(&self.cwd).text;
+        let sys = system_prompt(&self.cwd, &rules, &[]) + SUB_RULE + READONLY_RULE;
+        let provider = self.subagent.clone().unwrap_or_else(|| self.provider.clone());
+        for (k, (t, _)) in jobs.iter().enumerate() {
+            let first: String = t.trim().lines().next().unwrap_or("").chars().take(90).collect();
+            self.send(Ev::Info(format!("▶ sub-agent {}/{n} (baca saja{}): {first}", k + 1, if n > 1 { ", paralel" } else { "" })));
+        }
+        self.stat.subagents += n as u32;
+        let (cwd, cancel, tx) = (self.cwd.clone(), self.cancel.clone(), self.tx.clone());
+        let results: Vec<(End, String, usize)> = std::thread::scope(|s| {
+            let handles: Vec<_> = jobs.iter().enumerate().map(|(k, (task, files))| {
+                let (ctx, crx) = channel();
+                let mut a = Agent::new(provider.clone(), Perm::default(), false, cwd.clone(), cancel.clone(), ctx);
+                (a.sub, a.readonly, a.map) = (true, true, false);
+                a.tools = tools::readonly_schema();
+                a.schema_bytes = a.tools.to_string().len() * 11 / 10;
+                a.msgs = vec![json!({"role":"system","content":sys.clone()})];
+                let fwd = tx.clone();
+                let label = if n > 1 { format!("[{}/{n}] ", k + 1) } else { String::new() };
+                // Jejak tool sub-agent tampil sebagai catatan; teksnya dikumpulkan sebagai laporan.
+                s.spawn(move || {
+                    for e in crx {
+                        if let Ev::Tool { title, .. } = e {
+                            let _ = fwd.send(Ev::Info(format!("  {label}● {}", title.chars().take(100).collect::<String>())));
+                        }
+                    }
+                });
+                let mut u = format!("Task from the main agent:\n{}\n", task.trim());
+                if !files.is_empty() {
+                    u += &format!("\nStart from: {}\n", files.join(", "));
+                }
+                s.spawn(move || {
+                    let end = a.run(u);
+                    let steps = a.msgs.iter().filter(|m| m["role"] == "tool").count();
+                    let report = a.msgs.iter().rev().find(|m| m["role"] == "assistant" && m["content"].as_str().is_some_and(|s| !s.trim().is_empty()))
+                        .and_then(|m| m["content"].as_str()).unwrap_or("").trim().to_string();
+                    (end, report, steps)
+                })
+            }).collect();
+            handles.into_iter().map(|h| h.join().unwrap_or((End::Error("thread sub-agent gagal".into()), String::new(), 0))).collect()
+        });
+        results.into_iter().enumerate().map(|(k, (end, report, steps))| {
+            let ok = end == End::Done;
+            let how = match &end {
+                End::Done => "finished".to_string(),
+                End::Stuck(e) => format!("stopped before finishing: {e}"),
+                End::Error(e) => format!("failed: {e}"),
+                End::Stop => "stopped (cancelled or a permission was needed)".to_string(),
+            };
+            self.send(Ev::Info(format!("◀ sub-agent {}/{n} {}: {steps} langkah", k + 1, if ok { "selesai" } else { "berhenti" })));
+            let text = format!("Read-only sub-agent {how} after {steps} tool calls.\nReport:\n{}", if report.is_empty() { "(no report)" } else { &report });
+            Output { text, summary: String::new(), ok }
+        }).collect()
+    }
+
     fn set_flow(&mut self, want: Option<String>) {
         let Some(w) = want else {
             let plan = self.planner.as_ref().map_or("model utama".into(), Provider::label);
@@ -874,16 +1026,22 @@ impl Agent {
     fn call(&mut self, c: &Value, history: &mut Vec<String>) -> (Output, Step) {
         let name = c["function"]["name"].as_str().unwrap_or("").to_string();
         let args = match &c["function"]["arguments"] {
-            Value::String(s) => match serde_json::from_str(s) {
-                Ok(v) => v,
-                Err(_) => {
+            Value::String(s) => match serde_json::from_str::<Value>(s).ok().filter(Value::is_object).or_else(|| {
+                let r = tools::repair_args(s);
+                self.stat.repaired_args += u32::from(r.is_some());
+                r
+            }) {
+                Some(v) => v,
+                None => {
                     let e = "argumen tool bukan JSON yang sah; kirim ulang";
                     self.send(Ev::Tool { title: name, detail: vec![] });
                     self.send(Ev::ToolDone { ok: false, summary: e.into() });
                     return (Output::err(e), Step::Continue);
                 }
             },
-            v => v.clone(),
+            // Objek di dalam string ganda, dsb.
+            Value::Object(_) => c["function"]["arguments"].clone(),
+            v => v.as_str().and_then(tools::repair_args).unwrap_or_else(|| v.clone()),
         };
         let key = format!("{name}{args}");
         history.push(key.clone());
@@ -901,7 +1059,16 @@ impl Agent {
                 return (Output::err(e), Step::Continue);
             }
         };
-        if let Action::Task { task, files } = &p.action {
+        if self.readonly && !matches!(p.action, Action::Read { .. } | Action::Grep { .. }) {
+            self.send(Ev::Tool { title: p.title.clone(), detail: vec![] });
+            self.send(Ev::ToolDone { ok: false, summary: "sub-agent baca-saja".into() });
+            return (Output::err("this sub-agent is read-only: only read, grep, head, and tail are available"), Step::Continue);
+        }
+        if let Action::Task { task, files, readonly } = &p.action {
+            if *readonly && !self.sub {
+                let o = self.readonly_tasks(vec![(task.clone(), files.clone())]).pop().unwrap_or_else(|| Output::err("sub-agent gagal"));
+                return (o, Step::Continue);
+            }
             return self.subtask(task, files);
         }
         if let Action::Write { path, new, .. } = &p.action
@@ -1023,6 +1190,89 @@ impl Agent {
         }
     }
 
+    /// Uji proyek untuk file yang berubah di giliran ini, bila belum lulus untuk isi yang sama.
+    fn gate(&mut self) -> GateEnd {
+        let changed: Vec<PathBuf> = self.turn_log.keys().cloned().collect();
+        if changed.is_empty() || self.gates.is_empty() {
+            return GateEnd::Skip;
+        }
+        let state = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::hash::DefaultHasher::new();
+            for p in &changed {
+                p.hash(&mut h);
+                std::fs::read(p).ok().hash(&mut h);
+            }
+            h.finish()
+        };
+        if self.gate_ok == Some(state) {
+            return GateEnd::Skip;
+        }
+        let run: Vec<(usize, String)> = self.gates.iter().enumerate().filter_map(|(i, g)| g.command(&changed).map(|c| (i, c))).collect();
+        if run.is_empty() {
+            return GateEnd::Skip;
+        }
+        // Uji menjalankan kode proyek: ditanya seperti bash.
+        let safe = run.iter().all(|(i, _)| self.gates[*i].safe);
+        if !(safe || self.verify_ok || self.perm.is_all() || self.perm.allow_bash) {
+            if !self.interactive {
+                return GateEnd::Skip;
+            }
+            self.send(Ev::Tool { title: "uji proyek".into(), detail: run.iter().map(|(_, c)| ('$', 0, c.clone())).collect() });
+            let (reply, rx) = channel();
+            self.send(Ev::Ask { question: "Jalankan uji proyek sebelum selesai?".into(), always: Some("Ya, selalu uji selama sesi"), reply });
+            match rx.recv().unwrap_or(Answer::No) {
+                Answer::Yes => {}
+                Answer::Always => self.verify_ok = true,
+                Answer::No => {
+                    self.gates.clear();
+                    self.send(Ev::ToolDone { ok: false, summary: "uji proyek dimatikan untuk sesi ini".into() });
+                    return GateEnd::Skip;
+                }
+            }
+        } else {
+            self.send(Ev::Tool { title: "uji proyek".into(), detail: run.iter().map(|(_, c)| ('$', 0, c.chars().take(160).collect())).collect() });
+        }
+        let (mut failed, mut gone) = (vec![], vec![]);
+        for (i, cmd) in &run {
+            let p = Prepared { action: Action::Bash { cmd: cmd.clone(), timeout: 600 }, title: "uji".into(), guarded: false, memory: false };
+            let o = tools::run(p, &self.gates[*i].dir, self.provider.ctx, &self.cancel);
+            if self.cancel.is_set() {
+                self.send(Ev::ToolDone { ok: false, summary: "dibatalkan".into() });
+                return GateEnd::Skip;
+            }
+            if o.text.ends_with("[exit 127]") {
+                gone.push(*i);
+                continue;
+            }
+            if !o.ok {
+                let shown = if self.gates[*i].safe { "LaTeX: compile twice, check undefined references".to_string() } else { cmd.clone() };
+                failed.push(format!("$ {shown}\n{}", verify::test_summary(&o.text)));
+            }
+        }
+        for i in gone.iter().rev() {
+            self.gates.remove(*i);
+        }
+        if failed.is_empty() {
+            self.stat.gate_pass += 1;
+            self.gate_ok = Some(state);
+            self.send(Ev::ToolDone { ok: true, summary: "lulus".into() });
+            return GateEnd::Pass;
+        }
+        self.stat.gate_fail += 1;
+        self.send(Ev::ToolDone { ok: false, summary: "gagal; dikembalikan ke model".into() });
+        let all = failed.join("\n\n");
+        let mut code = String::new();
+        for (p, n) in verify::locations(&all, &self.cwd, &self.cwd, 2) {
+            if !tools::is_secret_path(&self.cwd, &p)
+                && let Some(s) = verify::slice(&p, n, &self.cwd)
+            {
+                code += &format!("\n{s}");
+            }
+        }
+        GateEnd::Fail(format!("[llmy ran the project's tests after your changes and they FAIL. Fix the code, not the tests (unless the user asked to change tests), then finish.]\n{all}{code}"))
+    }
+
     /// Jalankan pemeriksaan untuk file yang diubah di langkah ini. Hasilnya untuk model,
     /// atau None bila tidak ada yang dijalankan.
     pub(crate) fn verify(&mut self) -> Option<String> {
@@ -1087,15 +1337,32 @@ impl Agent {
             return None;
         }
         if failed.is_empty() {
+            self.stat.check_pass += 1;
             self.vmem.passed();
             self.send(Ev::ToolDone { ok: true, summary: format!("lulus{missing}") });
             return Some(format!("\n\n[llmy check passed: {}]", ran.join("; ")));
         }
+        self.stat.check_fail += 1;
         self.vmem.failed(weight);
         self.vmem.errors = failed.join("\n\n");
         let n = self.vmem.streak;
         self.send(Ev::ToolDone { ok: false, summary: format!("gagal ({n}/{}){missing}", verify::MAX_STREAK) });
-        Some(format!("\n\n[llmy check FAILED after this step. Fix these errors:]\n{}", failed.join("\n\n")))
+        // Potongan kode di lokasi galat: model kecil tidak perlu membaca file lagi.
+        let all = failed.join("\n\n");
+        let dirs: Vec<PathBuf> = run.iter().map(|(i, _)| self.checks.get(*i).map_or(self.cwd.clone(), |c| c.dir.clone())).collect();
+        let mut code = String::new();
+        let mut seen = vec![];
+        for d in dirs.iter().chain(std::iter::once(&self.cwd)) {
+            for (p, n) in verify::locations(&all, d, &self.cwd, 2) {
+                if seen.len() < 2 && !seen.contains(&(p.clone(), n)) && !tools::is_secret_path(&self.cwd, &p)
+                    && let Some(s) = verify::slice(&p, n, &self.cwd)
+                {
+                    code += &format!("\n{s}");
+                    seen.push((p, n));
+                }
+            }
+        }
+        Some(format!("\n\n[llmy check FAILED after this step. Fix these errors:]\n{all}{}", if code.is_empty() { String::new() } else { format!("\n{code}") }))
     }
 
     fn ask(&self, p: &Prepared) -> Answer {
@@ -1188,6 +1455,20 @@ impl Agent {
 
 const SUMMARY: &str = "[Summary of the conversation so far]";
 
+/// Pemisah antara catatan llmy (peta proyek, state) dan kata-kata pengguna dalam satu pesan.
+const USER_MARK: &str = "\n\nUser request:\n";
+
+/// Kata-kata pengguna saja, tanpa catatan llmy di depannya.
+pub(crate) fn user_part(t: &str) -> &str {
+    if t.starts_with("[llmy") || t.starts_with("[Project map") {
+        t.split_once(USER_MARK).map_or(t, |x| x.1)
+    } else {
+        t
+    }
+}
+
+const READONLY_RULE: &str = "\n- You can only read and search (read, grep, head, tail); you cannot change files or run commands. Report exact file paths and line numbers.";
+
 const SUB_RULE: &str = "\n- You are a sub-agent. The main agent gave you one task and cannot see your messages, only your final reply. Do the task with the tools; there is no user to ask. Then reply with a short report: what you found or changed (with file paths), and anything not done.";
 
 /// Ukuran pesan tanpa salinan `blocks`/`parts` (isinya sama dengan content dan tool_calls) dan
@@ -1213,7 +1494,7 @@ const SUMMARIZE: &str = "Write notes about this conversation so the work can con
 fn requests(msgs: &[Value], skip: Option<&str>) -> String {
     let mut v: Vec<String> = vec![];
     for m in msgs.iter().filter(|m| m["role"] == "user") {
-        let t = m["content"].as_str().unwrap_or("");
+        let t = user_part(m["content"].as_str().unwrap_or(""));
         if let Some(old) = t.strip_prefix(SUMMARY) {
             v.extend(old.lines().skip(2).take_while(|l| l.starts_with("> ")).map(String::from));
         } else {

@@ -27,6 +27,12 @@ fn cap(max: usize, ctx: u64) -> usize {
 }
 const FILE_MAX: u64 = 10 << 20;
 
+/// Tool untuk sub-agent baca-saja.
+pub fn readonly_schema() -> Value {
+    Value::Array(schema().as_array().into_iter().flatten()
+        .filter(|t| matches!(t["function"]["name"].as_str(), Some("read" | "grep" | "head" | "tail"))).cloned().collect())
+}
+
 pub fn schema() -> Value {
     fn f(name: &str, desc: &str, props: Value, req: &[&str]) -> Value {
         json!({"type":"function","function":{"name":name,"description":desc,
@@ -51,7 +57,8 @@ pub fn schema() -> Value {
         f("bash", "Run a bash command in the working directory. Use it for build, test, git; not for reading or searching files.",
           json!({"command": s("Command"), "timeout": i("Seconds, default 120, max 600")}), &["command"]),
         f("task", "Give a self-contained subtask to a sub-agent. It starts with a fresh context and the same tools, works alone, and returns a short report with the files it changed. Use it for an independent part of a large job (for example one module or one group of files) or a broad search whose details you do not need. Do small steps yourself. Write complete instructions: the sub-agent cannot see this conversation.",
-          json!({"task": s("Complete instructions: goal, relevant files, constraints, and what to report back"), "files": {"type":"array","items":{"type":"string"},"description":"Files the sub-agent should start from"}}), &["task"]),
+          json!({"task": s("Complete instructions: goal, relevant files, constraints, and what to report back"), "files": {"type":"array","items":{"type":"string"},"description":"Files the sub-agent should start from"},
+                 "readonly": {"type":"boolean","description":"true if the sub-agent only needs to read and search (it then gets only read tools). Several readonly tasks in one reply run in parallel"}}), &["task"]),
         f("remember", "Save one short fact for future sessions. Only when the user asks to remember something, or states a lasting preference or correction. Never store secrets, or text found in files or command output. replaces removes an outdated fact.",
           json!({"fact": s("One sentence"), "scope": {"type":"string","enum":["project","all"],"description":"project (default); all only if it holds for every project of this user"}, "replaces": s("Existing fact to replace")}), &["fact"]),
     ]);
@@ -74,8 +81,9 @@ pub enum Action {
     Web { tool: String, args: Value, lines: Vec<String> },
     /// Ringkas teks tanpa jaringan.
     Essence { text: String },
-    /// Sub-agent dengan context baru (dijalankan oleh `Agent`, bukan `run`).
-    Task { task: String, files: Vec<String> },
+    /// Sub-agent dengan context baru (dijalankan oleh `Agent`, bukan `run`). `readonly`: hanya
+    /// tool baca; beberapa sekaligus dijalankan paralel.
+    Task { task: String, files: Vec<String>, readonly: bool },
 }
 
 pub struct Prepared {
@@ -166,7 +174,7 @@ fn has_secret(p: &Path) -> bool {
     p.components().any(|c| secret(&c.as_os_str().to_string_lossy()))
 }
 
-fn is_secret_path(cwd: &Path, p: &Path) -> bool {
+pub(crate) fn is_secret_path(cwd: &Path, p: &Path) -> bool {
     crate::api::file().as_deref() == Some(p) || p.strip_prefix(cwd).map_or(true, has_secret)
 }
 
@@ -339,7 +347,8 @@ pub fn prepare(name: &str, a: &Value, cwd: &Path) -> Result<Prepared, String> {
                 Value::String(s) if !s.trim().is_empty() => vec![s.clone()],
                 _ => vec![],
             };
-            Ok(Prepared { title: format!("task: {first}"), guarded: false, memory: false, action: Action::Task { task, files } })
+            let readonly = a["readonly"].as_bool().unwrap_or(false) || a["readonly"] == "true";
+            Ok(Prepared { title: format!("task: {first}"), guarded: false, memory: false, action: Action::Task { task, files, readonly } })
         }
         "remember" => {
             let opt = |k: &str| if a[k].is_null() { Ok(String::new()) } else { str_arg(a, k) };
@@ -371,6 +380,81 @@ pub fn prepare(name: &str, a: &Value, cwd: &Path) -> Result<Prepared, String> {
             None => Err(format!("tool `{name}` tidak ada. Yang tersedia: {}", names())),
         },
     }
+}
+
+/// Argumen tool berupa teks yang bukan JSON sah, diperbaiki bila kesalahannya umum pada model kecil:
+/// dibungkus ```json, JSON di dalam string, koma di akhir, ganti baris mentah di dalam string,
+/// kutip tunggal, atau True/False/None ala Python. Hasilnya harus objek.
+pub fn repair_args(raw: &str) -> Option<Value> {
+    let mut s = raw.trim();
+    if let Some(r) = s.strip_prefix("```") {
+        s = r.trim_start_matches(|c: char| c.is_ascii_alphabetic()).trim();
+        s = s.strip_suffix("```").unwrap_or(s).trim();
+    }
+    let obj = |v: Value| match v {
+        Value::Object(_) => Some(v),
+        Value::String(inner) => serde_json::from_str::<Value>(&inner).ok().filter(Value::is_object),
+        _ => None,
+    };
+    if let Ok(v) = serde_json::from_str::<Value>(s) {
+        return obj(v);
+    }
+    let single = !s.contains('"') && s.contains('\'');
+    let mut out = String::with_capacity(s.len() + 16);
+    let (mut in_str, mut esc) = (false, false);
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let mut c = chars[i];
+        if single && c == '\'' && !esc {
+            c = '"';
+        }
+        if in_str {
+            match c {
+                _ if esc => esc = false,
+                '\\' => esc = true,
+                '"' => in_str = false,
+                '\n' => {
+                    out.push_str("\\n");
+                    i += 1;
+                    continue;
+                }
+                '\t' => {
+                    out.push_str("\\t");
+                    i += 1;
+                    continue;
+                }
+                '\r' => {
+                    i += 1;
+                    continue;
+                }
+                _ => {}
+            }
+            out.push(c);
+        } else {
+            match c {
+                '"' => {
+                    in_str = true;
+                    out.push(c);
+                }
+                // Koma tepat sebelum } atau ].
+                ',' if chars[i + 1..].iter().find(|x| !x.is_whitespace()).is_some_and(|x| *x == '}' || *x == ']') => {}
+                _ => {
+                    let rest: String = chars[i..chars.len().min(i + 5)].iter().collect();
+                    let word = [("True", "true"), ("False", "false"), ("None", "null")].iter().find(|(w, _)| rest.starts_with(w));
+                    let before = out.chars().rev().find(|x| !x.is_whitespace());
+                    if let Some((w, r)) = word.filter(|_| matches!(before, Some(':' | '[' | ','))) {
+                        out.push_str(r);
+                        i += w.len();
+                        continue;
+                    }
+                    out.push(c);
+                }
+            }
+        }
+        i += 1;
+    }
+    serde_json::from_str::<Value>(&out).ok().and_then(obj)
 }
 
 /// `12│isi` -> (12, isi).
@@ -465,11 +549,17 @@ pub fn apply_edit(src: &str, old: &str, new: &str, all: bool, hint: bool) -> Res
         return Ok(format!("{}{new}{}", &src[..i], &src[i + old.len()..]));
     }
     match hits.len() {
+        // Model kecil sering salah indentasi atau menambah spasi di ujung baris: cocokkan per baris
+        // dengan selisih indentasi yang sama di semua baris, hanya bila tempatnya satu.
+        0 if hint && !all && let Some(r) = loose_edit(src, &old, &new) => r,
         0 => {
             let mut e = String::from("`old` tidak ditemukan di file.");
             let first = old.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
             if hint && let Some((n, l)) = src.lines().enumerate().find(|(_, l)| !first.is_empty() && l.trim() == first) {
-                e += &format!(" Baris mirip ada di {}: {:?}. Samakan spasi/indentasi persis.", n + 1, l);
+                e += &format!(" Baris mirip ada di {}: {:?}. Samakan spasi/indentasi persis. Isi file saat ini di sana:\n", n + 1, l);
+                for (i, l) in src.lines().enumerate().skip(n.saturating_sub(2)).take(old.lines().count().max(1) + 4) {
+                    e += &format!("{}{SEP}{}\n", i + 1, clip(l, 300));
+                }
             } else {
                 e += " Baca ulang file dengan read, lalu salin teksnya persis tanpa nomor baris.";
             }
@@ -483,6 +573,75 @@ pub fn apply_edit(src: &str, old: &str, new: &str, all: bool, hint: bool) -> Res
             Err(format!("`old` muncul {n} kali (baris {}). Tambah konteks agar unik, atau replace_all=true.", at.join(", ")))
         }
     }
+}
+
+/// Selisih indentasi file terhadap `old`: ditambahkan, atau dibuang dari `new`.
+enum Indent {
+    Add(String),
+    Cut(String),
+}
+
+/// Banyaknya edit yang berhasil lewat pencocokan longgar (untuk metrik).
+pub static LOOSE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Edit longgar: baris `old` cocok dengan baris file bila isinya sama setelah spasi ujung dibuang
+/// dan selisih indentasinya sama untuk semua baris. Hasil None bila tidak ada atau lebih dari satu.
+fn loose_edit(src: &str, old: &str, new: &str) -> Option<Result<String, String>> {
+    let want: Vec<&str> = old.trim_end_matches(['\n', '\r']).split('\n').map(|l| l.trim_end_matches('\r')).collect();
+    if want.iter().all(|l| l.trim().is_empty()) {
+        return None;
+    }
+    // Awal setiap baris file (byte).
+    let starts: Vec<usize> = std::iter::once(0).chain(src.match_indices('\n').map(|(i, _)| i + 1)).collect();
+    let lines: Vec<&str> = src.split('\n').map(|l| l.trim_end_matches('\r')).collect();
+    let lead = |l: &str| l[..l.len() - l.trim_start().len()].to_string();
+    let mut found: Vec<(usize, Indent)> = vec![];
+    'cand: for i in 0..lines.len().saturating_sub(want.len() - 1) {
+        let mut delta: Option<Indent> = None;
+        for (j, w) in want.iter().enumerate() {
+            let l = lines[i + j];
+            if w.trim().is_empty() && l.trim().is_empty() {
+                continue;
+            }
+            if w.trim() != l.trim() {
+                continue 'cand;
+            }
+            let (ls, lw) = (lead(l), lead(w));
+            let d = if let Some(add) = ls.strip_prefix(&lw) {
+                Indent::Add(add.to_string())
+            } else if let Some(cut) = lw.strip_prefix(&ls) {
+                Indent::Cut(cut.to_string())
+            } else {
+                continue 'cand;
+            };
+            match (&delta, &d) {
+                (None, _) => delta = Some(d),
+                (Some(Indent::Add(a)), Indent::Add(b)) | (Some(Indent::Cut(a)), Indent::Cut(b)) if a == b => {}
+                _ => continue 'cand,
+            }
+        }
+        found.push((i, delta.unwrap_or(Indent::Add(String::new()))));
+        if found.len() > 1 {
+            return None;
+        }
+    }
+    let (i, delta) = found.pop()?;
+    let from = *starts.get(i)?;
+    let last = i + want.len() - 1;
+    let to = starts.get(last).map(|s| s + lines[last].len())?;
+    let new: Vec<String> = new.trim_end_matches(['\n', '\r']).split('\n').map(|l| {
+        let l = l.trim_end_matches('\r');
+        if l.trim().is_empty() {
+            return l.to_string();
+        }
+        match &delta {
+            Indent::Add(a) => format!("{a}{l}"),
+            Indent::Cut(c) => l.strip_prefix(c.as_str()).unwrap_or(l).to_string(),
+        }
+    }).collect();
+    let joined = new.join(if src.contains("\r\n") { "\r\n" } else { "\n" });
+    LOOSE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Some(Ok(format!("{}{joined}{}", &src[..from], &src[to..])))
 }
 
 /// Diff satu blok: awalan dan akhiran yang sama dibuang, sisakan 2 baris konteks.
@@ -833,7 +992,41 @@ mod tests {
         let d = dir("task");
         assert!(prepare("task", &json!({"task": "cek"}), &d).is_err());
         let p = prepare("task", &json!({"task": "Cari semua pemanggil fungsi area di src dan laporkan", "files": "src/lib.rs"}), &d).unwrap();
-        assert!(matches!(&p.action, Action::Task { files, .. } if files == &vec!["src/lib.rs".to_string()]));
+        assert!(matches!(&p.action, Action::Task { files, readonly: false, .. } if files == &vec!["src/lib.rs".to_string()]));
+        let p = prepare("task", &json!({"task": "Cari semua pemanggil fungsi area", "readonly": true}), &d).unwrap();
+        assert!(matches!(&p.action, Action::Task { readonly: true, .. }));
+    }
+
+    #[test]
+    fn argumen_rusak_diperbaiki() {
+        let ok = |s: &str| repair_args(s).unwrap_or_else(|| panic!("{s}"));
+        assert_eq!(ok("{\"path\": \"a.rs\",}")["path"], "a.rs");
+        assert_eq!(ok("```json\n{\"path\": \"a.rs\"}\n```")["path"], "a.rs");
+        assert_eq!(ok("\"{\\\"path\\\": \\\"a.rs\\\"}\"")["path"], "a.rs");
+        assert_eq!(ok("{\"path\": \"a.py\", \"content\": \"baris 1\nbaris 2\"}")["content"], "baris 1\nbaris 2");
+        assert_eq!(ok("{'path': 'a.rs', 'limit': 5}")["limit"], 5);
+        let v = ok("{\"replace_all\": True, \"x\": None, \"teks\": \"True story\"}");
+        assert_eq!((v["replace_all"].clone(), v["x"].clone(), v["teks"].clone()), (json!(true), Value::Null, json!("True story")));
+        assert_eq!(ok("{\"a\": [1, 2,], \"s\": \"x, }\"}")["s"], "x, }");
+        assert!(repair_args("[1, 2]").is_none() && repair_args("bukan json").is_none() && repair_args("{\"a\": ").is_none());
+    }
+
+    #[test]
+    fn edit_longgar_indentasi_dan_spasi_ujung() {
+        let src = "fn a() {\n    if x {\n        y();   \n    }\n}\n";
+        // Indentasi kurang satu tingkat, spasi ujung berbeda: diterapkan dengan indentasi file.
+        let r = apply_edit(src, "if x {\n    y();\n}", "if x {\n    z();\n}", false, true).unwrap();
+        assert_eq!(r, "fn a() {\n    if x {\n        z();\n    }\n}\n");
+        // Indentasi berlebih.
+        let r = apply_edit("def f():\n    return 1\n", "        return 1", "        return 2", false, true).unwrap();
+        assert_eq!(r, "def f():\n    return 2\n");
+        // Selisih tidak konsisten antar baris: ditolak, galat menampilkan isi file.
+        let e = apply_edit(src, "if x {\ny();\n}", "z", false, true).unwrap_err();
+        assert!(e.contains("Isi file saat ini") && e.contains("2│    if x {"), "{e}");
+        // Dua tempat cocok: ditolak.
+        assert!(apply_edit("  a\n  b\n    a\n    b\n", "a\nb", "c", false, true).is_err());
+        // File yang dijaga (hint=false): tetap persis.
+        assert!(apply_edit(src, "if x {\n    y();\n}", "z", false, false).is_err());
     }
 
     #[test]

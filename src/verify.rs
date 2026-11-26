@@ -220,6 +220,117 @@ pub fn detect(cwd: &Path, custom: Option<&str>) -> Vec<Check> {
     v
 }
 
+/// Uji proyek di akhir giliran: lebih lambat dari pemeriksaan per langkah, jadi dijalankan saat
+/// model menyatakan selesai.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Gate {
+    pub cmd: String,
+    pub dir: PathBuf,
+    exts: Vec<&'static str>,
+    /// Tidak menjalankan kode proyek (LaTeX tanpa shell escape).
+    pub safe: bool,
+    tex: bool,
+}
+
+impl Gate {
+    /// Perintah bila ada file relevan yang berubah.
+    pub fn command(&self, changed: &[PathBuf]) -> Option<String> {
+        let hit: Vec<&PathBuf> = changed.iter().filter(|p| p.starts_with(&self.dir) && p.extension().and_then(|e| e.to_str()).is_some_and(|e| self.exts.contains(&e))).collect();
+        if hit.is_empty() {
+            return None;
+        }
+        if !self.tex {
+            return Some(self.cmd.clone());
+        }
+        // Dua kali kompilasi: rujukan \ref baru terselesaikan di kompilasi kedua.
+        let out = std::env::temp_dir().join(format!("llmy-tex-{}", std::process::id()));
+        let roots = tex_roots(&self.dir, &hit);
+        let mut v = vec![];
+        for root in roots.iter().take(3) {
+            let dir = root.parent().unwrap_or(&self.dir);
+            for sub in tex_dirs(dir) {
+                let _ = std::fs::create_dir_all(out.join(sub));
+            }
+            let _ = std::fs::create_dir_all(&out);
+            let name = quote(&root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+            let o = quote(&out.display().to_string());
+            let run = format!("pdflatex -interaction=nonstopmode -halt-on-error -file-line-error -draftmode -no-shell-escape -output-directory={o} {name}");
+            let log = quote(&out.join("gate.txt").display().to_string());
+            v.push(format!("cd {} && {run} > /dev/null 2>&1; {run} > {log} 2>&1 || {{ grep -A2 -E '^(!|.*\\.tex:[0-9]+:)' {log} | head -n 30; exit 1; }}; ! grep -E 'LaTeX Warning: Reference .* undefined' {log}",
+                quote(&dir.display().to_string())));
+        }
+        (!v.is_empty()).then(|| v.join(" && "))
+    }
+}
+
+/// Uji proyek: `cargo test`, `pytest`/`unittest`, `npm test`/`node --test`, dan LaTeX (rujukan).
+pub fn gates(cwd: &Path, custom: Option<&str>) -> Vec<Gate> {
+    if matches!(custom.map(str::trim), Some("off" | "none" | "")) {
+        return vec![];
+    }
+    let mut v = vec![];
+    let g = |cmd: &str, dir: PathBuf, exts: Vec<&'static str>| Gate { cmd: cmd.into(), dir, exts, safe: false, tex: false };
+    if let Some(d) = find(cwd, "Cargo.toml") {
+        v.push(g("cargo test --quiet 2>&1", d, vec!["rs", "toml"]));
+    }
+    let files = crate::bdi::project_files(cwd);
+    let py_tests = files.iter().any(|f| {
+        let n = f.rsplit('/').next().unwrap_or(f);
+        n.ends_with(".py") && (n.starts_with("test_") || n.ends_with("_test.py"))
+    });
+    if py_tests {
+        let pytest = files.iter().any(|f| f.ends_with("conftest.py") || f.ends_with("pytest.ini"))
+            || std::fs::read_to_string(cwd.join("pyproject.toml")).is_ok_and(|t| t.contains("[tool.pytest"));
+        let py = if cfg!(windows) { "python" } else { "python3" };
+        let cmd = if pytest { format!("{py} -m pytest -q -x 2>&1") } else { format!("{py} -m unittest -q 2>&1") };
+        v.push(g(&cmd, cwd.to_path_buf(), vec!["py"]));
+    }
+    let js = vec!["js", "mjs", "cjs", "ts", "tsx"];
+    // Tanpa file uji, `npm test` (mis. jest) gagal dengan "No tests found": umpan balik yang menyesatkan.
+    let js_tests = files.iter().any(|f| f.contains(".test.") || f.contains(".spec.") || f.contains("_test.") || f.starts_with("test/") || f.contains("/test/") || f.contains("__tests__/"));
+    let pkg_test = find(cwd, "package.json").filter(|_| js_tests).and_then(|d| {
+        let pkg: serde_json::Value = std::fs::read_to_string(d.join("package.json")).ok().and_then(|s| serde_json::from_str(&s).ok())?;
+        let t = pkg["scripts"]["test"].as_str()?;
+        (!t.contains("no test specified")).then_some(d)
+    });
+    if let Some(d) = pkg_test {
+        v.push(g("npm test --silent 2>&1", d, js));
+    } else if js_tests && files.iter().any(|f| f.ends_with(".js") || f.ends_with(".mjs")) {
+        v.push(g("node --test 2>&1", cwd.to_path_buf(), js));
+    }
+    let root = ancestors(cwd).pop().unwrap_or_else(|| cwd.to_path_buf());
+    v.push(Gate { cmd: "pdflatex".into(), dir: root, exts: vec!["tex", "sty", "cls", "bib"], safe: true, tex: true });
+    v
+}
+
+/// Ringkasan kegagalan uji: baris yang menyebut kegagalan, plus ekor keluaran.
+pub fn test_summary(out: &str) -> String {
+    static RE: std::sync::OnceLock<regex_lite::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| regex_lite::Regex::new(r"(?i)(fail|panick|assert|error|expected|left|right|traceback|file .*line \d|\.(rs|py|js|tex):\d+|undefined|not ok)").unwrap());
+    let lines: Vec<&str> = out.lines().filter(|l| !l.trim().is_empty()).collect();
+    let tail = lines.len().saturating_sub(12);
+    let mut v: Vec<&str> = vec![];
+    for (i, l) in lines.iter().enumerate() {
+        if (re.is_match(l) || i >= tail) && !v.contains(l) {
+            v.push(l);
+        }
+    }
+    let total = v.len();
+    v.truncate(MAX_LINES);
+    let mut s = v.join("\n");
+    if s.len() > MAX_BYTES {
+        let mut i = MAX_BYTES;
+        while !s.is_char_boundary(i) {
+            i -= 1;
+        }
+        s.truncate(i);
+    }
+    if total > MAX_LINES {
+        s += &format!("\n... {} baris lagi dipotong", total - MAX_LINES);
+    }
+    s
+}
+
 /// Baris galat: peringatan dibuang bila ada galat, karena pada build yang gagal hanya mengaburkan.
 fn error_lines(out: &str) -> Vec<&str> {
     // LaTeX mencetak ratusan baris log; galatnya `file.tex:12: pesan` (atau `! pesan`) diikuti `l.12 ...`.
@@ -264,6 +375,55 @@ pub fn errors_first(out: &str) -> String {
         s += &format!("\n... {} baris lagi dipotong", total - lines.len());
     }
     s
+}
+
+/// Lokasi galat (file, baris) dari keluaran pemeriksaan: `src/a.rs:12:5`, `./main.tex:12:`,
+/// `lib/app.js:2`, atau `File "a.py", line 3`. Hanya file di dalam `cwd`, paling banyak `max`.
+pub fn locations(out: &str, dir: &Path, cwd: &Path, max: usize) -> Vec<(PathBuf, usize)> {
+    static RE: std::sync::OnceLock<(regex_lite::Regex, regex_lite::Regex)> = std::sync::OnceLock::new();
+    let (generic, py) = RE.get_or_init(|| {
+        (
+            regex_lite::Regex::new(r"([A-Za-z0-9_./\\-]+\.(?:rs|py|js|mjs|cjs|ts|tsx|go|tex|sty|cls)):(\d+)").unwrap(),
+            regex_lite::Regex::new(r#"File "([^"]+)", line (\d+)"#).unwrap(),
+        )
+    });
+    let mut v: Vec<(PathBuf, usize)> = vec![];
+    for l in out.lines() {
+        // Baris perintah (`$ ...`) bukan keluaran.
+        if l.starts_with("$ ") {
+            continue;
+        }
+        for c in generic.captures_iter(l).chain(py.captures_iter(l)) {
+            let (Some(f), Some(n)) = (c.get(1), c.get(2).and_then(|n| n.as_str().parse::<usize>().ok())) else { continue };
+            let p = dir.join(f.as_str().trim_start_matches("./"));
+            let Ok(p) = p.canonicalize() else { continue };
+            if !p.starts_with(cwd) || !p.is_file() || n == 0 || v.iter().any(|(q, m)| *q == p && m.abs_diff(n) < 6) {
+                continue;
+            }
+            v.push((p, n));
+            if v.len() >= max {
+                return v;
+            }
+        }
+    }
+    v
+}
+
+/// Baris di sekitar lokasi galat, bernomor seperti `read`.
+pub fn slice(path: &Path, line: usize, cwd: &Path) -> Option<String> {
+    let t = std::fs::read_to_string(path).ok()?;
+    let lines: Vec<&str> = t.lines().collect();
+    if line > lines.len() {
+        return None;
+    }
+    let (a, b) = (line.saturating_sub(6), (line + 5).min(lines.len()));
+    let rel = path.strip_prefix(cwd).unwrap_or(path).display().to_string().replace('\\', "/");
+    let mut s = format!("[code around {rel}:{line}]\n");
+    for (i, l) in lines[a..b].iter().enumerate() {
+        let l: String = l.chars().take(300).collect();
+        s += &format!("{}│{l}\n", a + i + 1);
+    }
+    Some(s)
 }
 
 pub fn state_hash(path: &Path, content: &str) -> u64 {
@@ -419,6 +579,51 @@ mod tests {
         let log = "This is pdfTeX\n(./main.tex\nLaTeX2e <2024>\n./main.tex:12: Undefined control sequence.\nl.12 \\foo\n           \nNo pages of output.\n[exit 1]";
         assert_eq!(errors_first(log), "./main.tex:12: Undefined control sequence.\nl.12 \\foo");
         assert_eq!(weight(log), 2);
+    }
+
+    #[test]
+    fn lokasi_galat_dan_potongan() {
+        let d = dir("verify-lokasi").canonicalize().unwrap();
+        fs::create_dir_all(d.join("src")).unwrap();
+        fs::write(d.join("src/a.rs"), (1..=30).map(|i| format!("baris {i}\n")).collect::<String>()).unwrap();
+        fs::write(d.join("b.py"), "x = (\n").unwrap();
+        let out = "$ cargo check src/a.rs:99\nsrc/a.rs:12:5: error[E0425]: x\nsrc/a.rs:14:1: error: y\n  File \"b.py\", line 1\n/etc/passwd.rs:3: x\nsrc/a.rs:25:1: error: z";
+        let v = locations(out, &d, &d, 3);
+        assert_eq!(v, vec![(d.join("src/a.rs"), 12), (d.join("b.py"), 1), (d.join("src/a.rs"), 25)]);
+        let s = slice(&d.join("src/a.rs"), 12, &d).unwrap();
+        assert!(s.starts_with("[code around src/a.rs:12]\n7│baris 7\n") && s.ends_with("17│baris 17\n"), "{s}");
+        assert!(slice(&d.join("src/a.rs"), 31, &d).is_none());
+    }
+
+    #[test]
+    fn uji_akhir_giliran() {
+        let d = dir("verify-gerbang");
+        let sub = d.join("sub");
+        fs::write(sub.join("test_a.py"), "").unwrap();
+        fs::write(sub.join("a.py"), "").unwrap();
+        fs::create_dir_all(sub.join("test")).unwrap();
+        fs::write(sub.join("test/x.test.js"), "").unwrap();
+        fs::write(sub.join("app.js"), "").unwrap();
+        let g = gates(&sub, None);
+        let cmds: Vec<&str> = g.iter().map(|x| x.cmd.as_str()).collect();
+        assert!(cmds.contains(&"python3 -m unittest -q 2>&1") || cfg!(windows), "{cmds:?}");
+        assert!(cmds.contains(&"node --test 2>&1"), "{cmds:?}");
+        let py = g.iter().find(|x| x.cmd.contains("unittest")).unwrap();
+        assert!(py.command(&[sub.join("a.py")]).is_some() && py.command(&[sub.join("x.md")]).is_none() && !py.safe);
+        fs::write(sub.join("conftest.py"), "").unwrap();
+        assert!(gates(&sub, None).iter().any(|x| x.cmd.contains("pytest")));
+        fs::write(sub.join("package.json"), r#"{"scripts":{"test":"vitest run"}}"#).unwrap();
+        assert!(gates(&sub, None).iter().any(|x| x.cmd == "npm test --silent 2>&1"));
+        // Tanpa file uji JS: tidak ada gerbang JS.
+        fs::remove_dir_all(sub.join("test")).unwrap();
+        assert!(!gates(&sub, None).iter().any(|x| x.cmd.contains("npm") || x.cmd.contains("node --test")));
+        assert!(gates(&sub, Some("off")).is_empty());
+        let tex = g.iter().find(|x| x.safe).unwrap();
+        fs::write(sub.join("main.tex"), "\\documentclass{article}\n").unwrap();
+        let c = tex.command(&[sub.join("main.tex")]).unwrap();
+        assert!(c.contains("Reference .* undefined") && c.contains("'main.tex'"), "{c}");
+        let s = test_summary("running 2 tests\ntest a ... ok\ntest b ... FAILED\nthread 'b' panicked at src/lib.rs:3:5:\nassertion `left == right` failed\n  left: 1\n right: 2\n");
+        assert!(s.contains("panicked at src/lib.rs:3:5") && s.contains("right: 2"), "{s}");
     }
 
     #[test]
