@@ -38,17 +38,17 @@ pub fn schema() -> Value {
         f("read", "Read a text file (with line numbers) or list a directory.",
           json!({"path": s("File or directory path, relative to the working directory"), "offset": i("First line, 1-based"), "limit": i("Number of lines")}), &["path"]),
         f("grep", "Search file contents with a regex, or list files by glob when pattern is omitted. Skips hidden files and build output. Use this instead of bash for searching.",
-          json!({"pattern": s("Regular expression"), "path": s("File or directory, relative to the working directory; default ."), "glob": s("File name filter, e.g. *.rs or src/**/*.ts"), "ignore_case": {"type":"boolean"}}), &[]),
+          json!({"pattern": s("Regular expression"), "path": s("File or directory, relative to the working directory; default ."), "glob": s("File name filter, e.g. *.rs or src/**/*.ts"), "ignore_case": {"type":"boolean","enum":[true,false]}}), &[]),
         f("edit", "Replace exact text in a file. `old` must match exactly, including indentation, and occur once unless replace_all is true. Do not include line numbers.",
-          json!({"path": s("File path, relative to the working directory"), "old": s("Exact existing text"), "new": s("Replacement text"), "replace_all": {"type":"boolean"}}), &["path", "old", "new"]),
+          json!({"path": s("File path, relative to the working directory"), "old": s("Exact existing text"), "new": s("Replacement text"), "replace_all": {"type":"boolean","enum":[true,false]}}), &["path", "old", "new"]),
         f("write", "Create a new file or overwrite a whole file. Prefer edit for existing files.",
           json!({"path": s("File path, relative to the working directory"), "content": s("Full file content")}), &["path", "content"]),
         f("bash", "Run a bash command in the working directory. Use it for build, test, git; not for reading or searching files.",
           json!({"command": s("Command"), "timeout": i("Seconds, default 120, max 600")}), &["command"]),
         f("curl", "Make HTTP request with curl. Supports GET, POST, PUT, DELETE etc. Use for API calls to Tavily, Exa, OpenAlex, GitHub API, or any RESTful endpoint.",
-          json!({"url": s("Full URL including scheme"), "method": s("HTTP method: GET, POST, PUT, DELETE, PATCH"), "headers": s("JSON object with headers (optional)"), "body": s("Request body for POST/PUT (optional)")})), &["url", "method"]),
+          json!({"url": s("Full URL including scheme"), "method": s("HTTP method: GET, POST, PUT, DELETE, PATCH"), "headers": s("JSON object with headers (optional)"), "body": s("Request body for POST/PUT (optional)")}), &["url", "method"]),
         f("firecrawl", "Crawl webpage or scrape single page with Firecrawl. Extract structured data from web pages. Supports scraping, crawling entire sites, and extracting metadata.",
-          json!({"url": s("URL to crawl/scrape"), "action": s("scrape for single page or crawl for site traversal"), "options": s("JSON options: depth, timeout, limit, proxy (optional)")})), &["url", "action"]),
+          json!({"url": s("URL to crawl/scrape"), "action": s("scrape for single page or crawl for site traversal"), "options": s("JSON options: depth, timeout, limit, proxy (optional)")}), &["url", "action"]),
         f("head", "Show first N lines of a file. Fast alternative to read offset=1.",
           json!({"path": s("File path, relative to the working directory"), "lines": i("Number of lines to show")}), &["path", "lines"]),
         f("tail", "Show last N lines of a file. Fast alternative to read at end with limit.",
@@ -56,7 +56,7 @@ pub fn schema() -> Value {
         f("github-search", "Search GitHub repositories, users, or content using GitHub API. Replace github.com with uithub.com or gitingest.com for full repo content.",
           json!({"query": s("GitHub search query"), "per_page": i("Results per page, max 100")}), &["query"]),
         f("openalex", "Search OpenAlex API for scholarly articles. Supports ORCID lookup, keyword search, and citation retrieval.",
-          json!({"search": s("Search query: keyword or URL"), "from_year": i("Publication year from (optional)"), "to_year": {"type":"integer","description":"Publication year to (optional), omit for no limit"}})), &["search"]),
+          json!({"search": s("Search query: keyword or URL"), "from_year": i("Publication year from (optional)"), "to_year": i("Publication year to (optional), omit for no limit")}), &["search"]),
         f("doi-resolver", "Resolve DOI to get metadata about publications. Fetches abstract, authors, journal info from Crossref API.",
           json!({"doi": s("DOI identifier with or without https://doi.org/")}), &["doi"]),
         f("scopus", "Search Scopus database for articles (requires setup with API key). Returns citation metrics and source data.",
@@ -79,13 +79,19 @@ pub enum Action {
     GithubSearch { query: String, per_page: u64 },
     /// OpenAlex API untuk pencarian artikel ilmiah.
     Openalex { search: String, from_year: Option<u64>, to_year: Option<u64> },
-    /// DOI resolver untuk mencari metadata publikasi.
+    /// DOI resolver via Crossref API.
     DoiResolver { doi: String },
-    /// Scopus API (mock - perlu setup sendiri dengan API key).
+    /// Scopus database search (requires setup with API key).
     Scopus { query: String, from_date: String, to_date: String },
-    /// Spider/crawler untuk crawling multiple pages.
+    /// Tavily search engine - khusus untuk agen AI & LLM dengan hasil terstruktur dan kutipan.
+    Tavily { search: String, topic: Option<String>, max_tokens: u32, days: u64 },
+    /// Exa search engine - pencarian semantik berbasis makna untuk menemukan halaman relevan.
+    Exa { query: String, num_results: usize, category: Option<String> },
+    /// Linkup API untuk extraction data dari halaman web.
+    Linkup { url: String, tags: Option<Vec<String>> },
+    /// GitHub API untuk mencari repositori, user, atau content.
+    Github { action: String, params: serde_json::Value },
     Spider { url: String, options: serde_json::Value },
-    /// Essence untuk ekstrak entitas/concepts dari text.
     Essence { text: String },
 }
 
@@ -1010,44 +1016,40 @@ mod tests {
     }
 
     fn curl(url: &str, method: &str, headers: &Option<serde_json::Value>, body: &Option<String>, cancel: &Cancel) -> Result<Output, String> {
-        // Gunakan httpreq untuk membuat request HTTP
-        let req = match httpreq::request(method, url) {
-            Ok(r) => r,
-            Err(e) => return Err(format!("curl: gagal membuat request: {}", e)),
-        };
-
+        // Gunakan subprocess untuk memanggil curl
+        let mut cmd = std::process::Command::new("curl");
+        
         if !cancel.wait(1000).is_err() {
-            req.header("Accept", "application/json")
-                .header("User-Agent", "llmy-agent/0.1");
+            cmd.arg("-s").arg("--max-time 30"); // silent, timeout 30 detik
+
+            match body {
+                Some(b) => cmd.arg("-d").arg(&b),
+                None => cmd.arg("-X").arg(method),
+            };
 
             if let Some(h) = headers {
                 if let Some(obj) = h.as_object() {
                     for (k, v) in obj.iter() {
                         if let Some(s) = v.as_str() {
-                            req.header(k, s);
-                        } else if let Some(arr) = v.as_array() {
-                            for item in arr {
-                                if let Some(v) = item.as_str() {
-                                    req.header(k, v);
-                                }
-                            }
+                            cmd.arg("-H").arg(format!("{}: {}", k, s));
                         }
                     }
                 }
             }
 
-            if let Some(b) = body {
-                req.header("Content-Type", "application/json");
-                req.send_string(&b)?;
-            } else {
-                req.send()?;
-            }
+            cmd.arg(&url);
         }
 
-        let res = match req.get() {
-            Ok(r) => r,
-            Err(e) => return Err(format!("curl: gagal send: {}", e)),
+        let output = match cmd.output() {
+            Ok(o) => o,
+            Err(e) => return Err(format!("curl: gagal jalankan: {}", e)),
         };
+
+        if !output.status.success() {
+            return Err(format!("curl: exit {}: {}", output.status, String::from_utf8_lossy(&output.stderr)));
+        }
+
+        let body = String::from_utf8(output.stdout).unwrap_or_default();
 
         if res.status_code == 404 || res.status_code == 403 {
             // Cek apakah ini response dari GitHub API atau error lainnya
@@ -1057,12 +1059,16 @@ mod tests {
             }
         }
 
-        let body = match res.read_to_string() {
-            Ok(b) => b,
-            Err(e) => return Err(format!("curl: gagal baca response: {}", e)),
+        let status_line = match String::from_utf8(output.stderr) {
+            Ok(s) => s.lines().next().and_then(|l| l.split(": ").nth(1)).map(|s| s.trim()).unwrap_or("200"),
+            Err(_) => "200",
+        };
+        let status_code = match status_line.parse::<u16>() {
+            Ok(c) => c,
+            Err(_) => 200,
         };
 
-        Ok(Output { text: body, summary: format!("{} {} -> {}\n{}", method, url, res.status_code, if body.len() > 1000 { "... (dipotong)" } else { "" }), ok: true })
+        Ok(Output { text: body, summary: format!("{} {} -> {}\n{}", method, url, status_code, if body.len() > 1000 { "... (dipotong)" } else { "" }), ok: true })
     }
 
     fn firecrawl(url: &str, action: &str, options: &serde_json::Value, cancel: &Cancel) -> Result<Output, String> {
@@ -1128,6 +1134,127 @@ mod tests {
             query.replace(" ", "+"));
 
         curl(&api_url, "GET", &None, Some(json!({}).to_string()), &Cancel {})
+    }
+
+    fn tavily(search: &str, topic: Option<&str>, max_tokens: u32, days: u64) -> Result<Output, String> {
+        // Tavily search API - search engine khusus untuk agen AI & LLM
+        let mut api_url = "https://api.tavily.com/search".to_string();
+        
+        let topic = if let Some(t) = topic {
+            format!("&topic={}", t)
+        } else {
+            String::new()
+        };
+
+        let max_tokens = if max_tokens == 0 {
+            "".to_string()
+        } else {
+            format!("&max_tokens={}", max_tokens)
+        };
+
+        let days_str = if days == 0 {
+            String::new()
+        } else {
+            format!("&days={}", days)
+        };
+
+        api_url.push_str(&format!("?query={}{}{}{}", 
+            search.replace(" ", "%20"), 
+            topic, max_tokens, days_str));
+
+        let headers = Some(json!({
+            "Accept": "application/json",
+            "Content-Type": "application/json"
+        }));
+
+        // Gunakan curl internal dengan headers
+        let body = json!({}).to_string();
+        
+        let res = match curl(&api_url, "GET", &headers, Some(body), &Cancel {}) {
+            Ok(r) => r,
+            Err(e) => return Err(format!("Tavily search error: {}", e))
+        };
+
+        if res.ok {
+            Ok(res)
+        } else {
+            Err(format!("Tavily API call failed"))
+        }
+    }
+
+    fn exa(query: &str, num_results: usize, category: Option<&str>) -> Result<Output, String> {
+        // Exa search API - pencarian semantik berbasis makna
+        let mut api_url = "https://api.exa.ai/search".to_string();
+        
+        let params = format!("?query={}&numResults={}", 
+            query.replace(" ", "%20"), 
+            num_results);
+
+        let category = if let Some(c) = category {
+            format!("&category={}", c)
+        } else {
+            String::new()
+        };
+
+        api_url.push_str(&format!("{}{}", &params, category));
+
+        let headers = Some(json!({
+            "Accept": "application/json",
+            "Content-Type": "application/json"
+        }));
+
+        curl(&api_url, "GET", &headers, Some(json!({}).to_string()), &Cancel {})
+    }
+
+    fn linkup(url: &str, tags: Option<&[String]>) -> Result<Output, String> {
+        // Linkup API untuk extraction data dari halaman web
+        let mut api_url = "https://api.linkup.com/".to_string();
+        
+        if let Some(t) = url.strip_prefix("http://") {
+            api_url.push_str(&format!("scrape?url={}&tags={}", t.replace(' ', "%20"), 
+                tags.map(|t| t.join(",")).unwrap_or_default()));
+        } else if let Some(t) = url.strip_prefix("https://") {
+            api_url.push_str(&format!("scrape?url={}&tags={}", t.replace(' ', "%20"), 
+                tags.map(|t| t.join(",")).unwrap_or_default()));
+        } else {
+            return Err("Linkup: URL harus dimulai dengan http:// atau https://".to_string());
+        }
+
+        let headers = Some(json!({
+            "Accept": "application/json",
+            "Content-Type": "application/json"
+        }));
+
+        curl(&api_url, "POST", &headers, Some(json!({}).to_string()), &Cancel {})
+    }
+
+    fn github(action: &str, params: &serde_json::Value) -> Result<Output, String> {
+        // GitHub API - handle berbagai action (search/repos/users/code)
+        let mut api_url = format!("https://api.github.com/{}", action);
+        
+        // Tambahkan parameters ke URL jika ada
+        if let Some(obj) = params.as_object() {
+            for (k, v) in obj.iter() {
+                if let Some(s) = v.as_str() {
+                    api_url.push_str(&format!("?{}={}", k, s));
+                } else if let Some(arr) = v.as_array() {
+                    for item in arr {
+                        if let Some(sk) = k {
+                            if let Some(sv) = item.as_str() {
+                                api_url.push_str(&format!("&{}={}&", sk, sv));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let headers = Some(json!({
+            "Accept": "application/vnd.github.v3+json",
+            "Content-Type": "application/json"
+        }));
+
+        curl(&api_url, action, &headers, None, &Cancel {})
     }
 
     fn parse_url(url: &str) -> Option<String> {
