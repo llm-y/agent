@@ -90,7 +90,7 @@ pub const FREE: [Free; 15] = [
         name: "nvidia", kind: Kind::OpenAi, env: &["NVIDIA_API_KEY"], keyless: false,
         label: "NVIDIA NIM", base: "https://integrate.api.nvidia.com/v1", list: None, check: None, public_list: true,
         key_url: "https://build.nvidia.com (Get API Key di halaman model)", key_hint: "",
-        models: &["moonshotai/kimi-k3.1-pro", "z-ai/glm-5.3-flash", "nvidia/nemotron-3-ultra-550b-a55b"],
+        models: &["nvidia/nemotron-3-ultra-550b-a55b", "z-ai/glm-5.3-flash", "moonshotai/kimi-k3.1-pro"],
         only_free: false, note: "gratis untuk pengembangan; sekitar 40 permintaan per menit",
     },
     Free {
@@ -121,7 +121,7 @@ pub const FREE: [Free; 15] = [
         name: "gemini", kind: Kind::Gemini, env: &["GEMINI_API_KEY", "GOOGLE_API_KEY"], keyless: false,
         label: "Google AI Studio (Gemini)", base: "https://generativelanguage.googleapis.com/v1beta", list: None, check: None, public_list: false,
         key_url: "https://aistudio.google.com/apikey", key_hint: "AIza",
-        models: &["gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-2.5-flash"],
+        models: &["gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-2.5-flash"],
         only_free: false, note: "batas harian kecil (Flash sekitar 20 per hari); data tier gratis dipakai melatih model Google",
     },
     Free {
