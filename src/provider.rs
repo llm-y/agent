@@ -490,6 +490,11 @@ impl Provider {
     }
 
     fn retryable(&self, e: &Fail) -> bool {
+        // Ollama gagal mengurai tool call yang ditulis model (HTTP 500): jawabannya acak, jadi
+        // diulang bisa berhasil.
+        if self.kind == Kind::Ollama {
+            return e.status == 500 && (e.msg.contains("syntax error") || e.msg.contains("parsing tool call") || e.msg.contains("parse tool call"));
+        }
         // Ollama lokal: gagal terhubung berarti memang mati, tak perlu menunggu.
         self.kind != Kind::Ollama
             && !e.no_retry

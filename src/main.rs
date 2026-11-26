@@ -19,6 +19,7 @@ mod setup;
 mod sys;
 mod text;
 mod tools;
+mod track;
 mod ui;
 mod verify;
 mod web;
@@ -78,6 +79,8 @@ Opsi:
       --plan <model>   model perencana mode bdi, mis. groq/openai/gpt-oss-120b (env LLMY_PLAN)
       --fallback <daftar>  model cadangan, dipisah koma: dipakai bergiliran bila kuota habis
                        atau server bermasalah (env LLMY_FALLBACK)
+      --sub <model>    model sub-agent (tool task), mis. model lokal yang cepat (env LLMY_SUB).
+                       Bawaan: model utama
       --auto           mode auto: setujui semua tanpa tanya (sama dengan --allow all), kecuali
                        path di luar folder kerja, di .git, atau file rahasia. Interaktif:
                        /auto atau Shift+Tab untuk menyalakan/mematikan
@@ -105,6 +108,7 @@ struct Opts {
     flow: agent::Flow,
     plan: Option<String>,
     fallback: Vec<String>,
+    sub: Option<String>,
 }
 
 fn default_model() -> String {
@@ -125,7 +129,7 @@ fn parse() -> Result<(Opts, impl FnOnce() -> Result<Provider, String>), String> 
     let cfg = api::Config::load();
     let mut o = Opts {
         perm: Perm::default(), prompt: None, resume: None, save: true, list: false, verify: None,
-        flow: agent::Flow::Loop, plan: env("LLMY_PLAN").or(cfg.plan), fallback: cfg.fallback,
+        flow: agent::Flow::Loop, plan: env("LLMY_PLAN").or(cfg.plan), fallback: cfg.fallback, sub: env("LLMY_SUB"),
     };
     let mut flow = env("LLMY_MODE").or(cfg.mode).unwrap_or("loop".into());
     if let Some(f) = env("LLMY_FALLBACK") {
@@ -169,6 +173,7 @@ fn parse() -> Result<(Opts, impl FnOnce() -> Result<Provider, String>), String> 
             "--verify" => o.verify = Some(val()?),
             "--mode" => flow = val()?,
             "--plan" => o.plan = Some(val()?),
+            "--sub" => o.sub = Some(val()?),
             "--fallback" => o.fallback = api::split_list(&val()?),
             "--auto" => o.perm.all.store(true, std::sync::atomic::Ordering::Relaxed),
             "--allow" => {
@@ -218,6 +223,7 @@ fn main() {
     }
     let provider = provider().unwrap_or_else(|e| die(&e));
     let planner = o.plan.as_deref().map(|p| provider.switch(p).unwrap_or_else(|e| die(&format!("--plan: {e}"))));
+    let subagent = o.sub.as_deref().map(|p| provider.switch(p).unwrap_or_else(|e| die(&format!("--sub: {e}"))));
     let cancel = Arc::new(Cancel::default());
     let (tx, rx) = channel();
     let interactive = o.prompt.is_none();
@@ -240,7 +246,7 @@ fn main() {
     let mut agent = Agent::new(provider, o.perm, interactive, cwd.clone(), cancel.clone(), tx.clone())
         .with_verify(o.verify)
         .with_session(session, history);
-    (agent.flow, agent.planner, agent.fallback) = (o.flow, planner, o.fallback);
+    (agent.flow, agent.planner, agent.fallback, agent.subagent) = (o.flow, planner, o.fallback, subagent);
     let (ctx, crx) = channel();
     std::thread::spawn(move || agent.serve(crx));
     match o.prompt {

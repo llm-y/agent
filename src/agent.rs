@@ -10,6 +10,8 @@ use crate::memory;
 use crate::rules;
 use crate::session::{self, Session};
 use crate::tools::{self, Action, Output, Prepared};
+use crate::track;
+use std::collections::BTreeMap;
 use crate::verify::{self, Check};
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -53,6 +55,8 @@ pub enum Cmd {
     Remember(String),
     /// `/mode`: None = tampilkan.
     Flow(Option<String>),
+    /// Kembalikan file yang diubah giliran terakhir.
+    Undo,
 }
 
 pub struct Agent {
@@ -84,9 +88,21 @@ pub struct Agent {
     pub fallback: Vec<String>,
     /// Isi asli file sebelum ditulis selama satu intention (None = belum ada), untuk rollback.
     pub(crate) snap: Option<std::collections::BTreeMap<PathBuf, Option<String>>>,
-    /// Sedang menjalankan pekerja BDI: macet bukan error akhir.
+    /// Sedang menjalankan pekerja BDI atau sub-agent: macet bukan error akhir, `task` tidak boleh.
     pub(crate) sub: bool,
+    /// Model sub-agent (`--sub`); None = model utama.
+    pub subagent: Option<Provider>,
+    /// Isi asli file yang diubah di giliran ini, dan giliran-giliran sebelumnya untuk `/undo`.
+    turn_log: BTreeMap<PathBuf, Option<String>>,
+    undo: Vec<BTreeMap<PathBuf, Option<String>>>,
+    /// Catatan untuk model, ikut pesan pengguna berikutnya (mis. setelah `/undo`).
+    note: Option<String>,
+    /// Pemindaian folder terakhir, untuk melihat file yang diubah `bash`.
+    pub(crate) tree: Option<track::Tree>,
 }
+
+/// Giliran yang bisa dibatalkan dengan `/undo`.
+const UNDO_MAX: usize = 20;
 
 enum Step {
     Continue,
@@ -159,6 +175,7 @@ impl Agent {
             used: 0, counted: 0, ratio: 3.0, session: None,
             checks: vec![], verify_ok: false, vmem: verify::Memory::default(),
             flow: Flow::Loop, planner: None, fallback: vec![], snap: None, sub: false,
+            subagent: None, turn_log: BTreeMap::new(), undo: vec![], note: None, tree: None,
         };
         // JSON skema + pembungkus per provider (perkiraan).
         a.schema_bytes = a.tools.to_string().len() * 11 / 10;
@@ -253,13 +270,24 @@ impl Agent {
         self.status();
         for cmd in rx {
             match cmd {
-                Cmd::User(s) => {
+                Cmd::User(mut s) => {
+                    if let Some(n) = self.note.take() {
+                        s = format!("{n}\n\n{s}");
+                    }
+                    self.turn_log.clear();
                     if self.flow == Flow::Bdi {
                         self.bdi(s);
                     } else {
                         self.turn(s);
                     }
+                    if !self.turn_log.is_empty() {
+                        self.undo.push(std::mem::take(&mut self.turn_log));
+                        if self.undo.len() > UNDO_MAX {
+                            self.undo.remove(0);
+                        }
+                    }
                 }
+                Cmd::Undo => self.undo(),
                 Cmd::Flow(f) => self.set_flow(f),
                 Cmd::Clear => {
                     self.msgs.truncate(1);
@@ -539,6 +567,8 @@ impl Agent {
             }
             self.fit();
             let tx = self.tx.clone();
+            // Teks sub-agent dan pekerja BDI bukan jawaban untuk pengguna: tampil sebagai catatan.
+            let quiet = self.sub;
             let mut thought = 0;
             let mut partial = String::new();
             let r = self.provider.chat(&self.msgs, &self.tools, Mode::Turn, &self.cancel, &mut |d| match d {
@@ -550,7 +580,9 @@ impl Agent {
                 }
                 Delta::Text(s) => {
                     partial.push_str(s);
-                    let _ = tx.send(Ev::Text(s.into()));
+                    if !quiet {
+                        let _ = tx.send(Ev::Text(s.into()));
+                    }
                 }
                 Delta::Think => {
                     thought += 1;
@@ -570,7 +602,8 @@ impl Agent {
                         self.send(Ev::Info("Dihentikan.".into()));
                         return End::Stop;
                     }
-                    self.send(Ev::Error(e.clone()));
+                    // Di sub-agent atau pekerja BDI, agent di atasnya yang memutuskan.
+                    self.send(if self.sub { Ev::Info(format!("Error: {e}")) } else { Ev::Error(e.clone()) });
                     return End::Error(e);
                 }
             };
@@ -619,6 +652,10 @@ impl Agent {
             }
             self.push(m);
             self.counted = self.msgs.len();
+            if quiet && !r.content.trim().is_empty() {
+                let t: String = r.content.trim().chars().take(800).collect();
+                self.send(Ev::Info(format!("  {}", t.replace('\n', "\n  "))));
+            }
             if r.calls.is_empty() {
                 if r.content.trim().is_empty() {
                     self.send(Ev::Info("Model tidak memberi jawaban.".into()));
@@ -728,6 +765,92 @@ impl Agent {
         false
     }
 
+    /// Catat isi file sebelum berubah: untuk `/undo` dan rollback intention BDI.
+    pub(crate) fn record(&mut self, path: &std::path::Path, before: Option<String>) {
+        if let Some(s) = &mut self.snap {
+            s.entry(path.to_path_buf()).or_insert_with(|| before.clone());
+        }
+        self.turn_log.entry(path.to_path_buf()).or_insert(before);
+    }
+
+    fn undo(&mut self) {
+        let Some(log) = self.undo.pop() else {
+            return self.send(Ev::Info("Tidak ada perubahan file yang bisa dibatalkan.".into()));
+        };
+        let (mut done, mut fail) = (vec![], vec![]);
+        for (p, old) in &log {
+            let rel = p.strip_prefix(&self.cwd).unwrap_or(p).display().to_string();
+            if std::fs::read_to_string(p).ok() == *old {
+                continue;
+            }
+            let r = match old {
+                Some(s) => std::fs::write(p, s),
+                None => std::fs::remove_file(p),
+            };
+            match r {
+                Ok(()) => done.push(rel),
+                Err(e) => fail.push(format!("{rel}: {e}")),
+            }
+        }
+        self.tree = None;
+        self.vmem.rollback();
+        if !done.is_empty() {
+            // Model harus tahu: isi file yang diingatnya sudah tidak berlaku.
+            self.note = Some(format!("[llmy: the user undid the file changes of the previous turn; these files are back to their earlier content: {}. Read them again before editing.]", done.join(", ")));
+        }
+        let left = if self.undo.is_empty() { String::new() } else { format!(" ({} giliran lagi bisa dibatalkan)", self.undo.len()) };
+        self.send(Ev::Info(if done.is_empty() { "File sudah sama dengan sebelum giliran itu.".into() } else { format!("Dikembalikan: {}{left}", done.join(", ")) }));
+        if !fail.is_empty() {
+            self.send(Ev::Error(format!("Gagal mengembalikan: {}", fail.join("; "))));
+        }
+    }
+
+    /// Sub-agent: context baru, tool dan izin yang sama, satu tingkat saja.
+    fn subtask(&mut self, task: &str, files: &[String]) -> (Output, Step) {
+        if self.sub {
+            return (Output::err("task is not available inside a subtask; do the work yourself"), Step::Continue);
+        }
+        let first: String = task.trim().lines().next().unwrap_or("").chars().take(100).collect();
+        self.send(Ev::Info(format!("▶ sub-agent: {first}")));
+        let mut u = format!("Task from the main agent:\n{}\n", task.trim());
+        if !files.is_empty() {
+            u += &format!("\nStart from: {}\n", files.join(", "));
+        }
+        let rules = rules::load(&self.cwd).text;
+        let sys = system_prompt(&self.cwd, &rules, &self.checks) + SUB_RULE;
+        let before: Vec<PathBuf> = self.turn_log.keys().cloned().collect();
+        let main = std::mem::replace(&mut self.msgs, vec![json!({"role":"system","content":sys})]);
+        let session = self.session.take();
+        let (used, counted) = (self.used, self.counted);
+        (self.used, self.counted, self.sub) = (0, 0, true);
+        let own = self.subagent.clone();
+        let keep = own.map(|p| std::mem::replace(&mut self.provider, p));
+        let end = self.run(u);
+        let steps = self.msgs.iter().filter(|m| m["role"] == "tool").count();
+        let report = self.msgs.iter().rev().find(|m| m["role"] == "assistant" && m["content"].as_str().is_some_and(|s| !s.trim().is_empty()))
+            .and_then(|m| m["content"].as_str()).unwrap_or("").trim().to_string();
+        if let Some(k) = keep {
+            self.provider = k;
+        }
+        self.msgs = main;
+        self.session = session;
+        (self.used, self.counted, self.sub) = (used, counted, false);
+        self.send(Ev::EndText);
+        let changed: Vec<String> = self.turn_log.keys().filter(|p| !before.contains(p))
+            .map(|p| p.strip_prefix(&self.cwd).unwrap_or(p).display().to_string()).collect();
+        let files = if changed.is_empty() { "none".to_string() } else { changed.join(", ") };
+        let (ok, how, step) = match &end {
+            End::Done => (true, "finished".to_string(), Step::Continue),
+            End::Stuck(e) => (false, format!("stopped before finishing: {e}"), Step::Continue),
+            End::Error(e) => (false, format!("failed: {e}"), Step::Continue),
+            End::Stop => (false, "stopped by the user or a denied permission".to_string(), Step::Stop),
+        };
+        self.send(Ev::Info(format!("◀ sub-agent {}: {steps} langkah, file diubah: {}", if ok { "selesai" } else { "berhenti" },
+            if changed.is_empty() { "-".into() } else { changed.join(", ") })));
+        let text = format!("Sub-agent {how} after {steps} tool calls.\nFiles changed: {files}\nReport:\n{}", if report.is_empty() { "(no report)" } else { &report });
+        (Output { text, summary: String::new(), ok }, step)
+    }
+
     fn set_flow(&mut self, want: Option<String>) {
         let Some(w) = want else {
             let plan = self.planner.as_ref().map_or("model utama".into(), Provider::label);
@@ -776,6 +899,9 @@ impl Agent {
                 return (Output::err(e), Step::Continue);
             }
         };
+        if let Action::Task { task, files } = &p.action {
+            return self.subtask(task, files);
+        }
         if let Action::Write { path, new, .. } = &p.action
             && !p.memory
             && self.vmem.tried(path, new)
@@ -835,10 +961,22 @@ impl Agent {
             (Action::Write { path, new, .. }, false) => Some((path.clone(), new.clone())),
             _ => None,
         };
-        if let (Some(snap), Some((path, _))) = (&mut self.snap, &written) {
-            snap.entry(path.clone()).or_insert_with(|| std::fs::read_to_string(path).ok());
+        if let Some((path, _)) = &written {
+            let before = std::fs::read_to_string(path).ok();
+            self.record(path, before);
+        }
+        // Perintah yang bisa mengubah file: pindai folder sebelum dan sesudahnya.
+        let watch = matches!(&p.action, Action::Bash { cmd, .. } if !reads_only(cmd));
+        if watch {
+            self.tree = Some(track::scan(&self.cwd, self.tree.as_ref().unwrap_or(&track::Tree::default())));
         }
         let mut o = tools::run(p, &self.cwd, self.provider.ctx, &self.cancel);
+        if watch && let Some(before) = self.tree.take() {
+            let after = track::scan(&self.cwd, &before);
+            let changes = track::diff(&before, &after);
+            self.tree = Some(after);
+            self.bash_changes(changes, &mut o);
+        }
         if o.ok
             && let Some((path, new)) = written
         {
@@ -850,6 +988,37 @@ impl Agent {
         }
         self.send(Ev::ToolDone { ok: o.ok, summary: o.summary.clone() });
         (o, Step::Continue)
+    }
+
+    /// File yang diubah `bash`: dicatat seperti edit (undo, rollback, verifikasi), dan model diberi tahu.
+    fn bash_changes(&mut self, changes: Vec<track::Change>, o: &mut Output) {
+        if changes.is_empty() {
+            return;
+        }
+        let mut names = vec![];
+        let mut lost = vec![];
+        for c in changes {
+            let rel = c.path.strip_prefix(&self.cwd).unwrap_or(&c.path).display().to_string();
+            if c.known {
+                self.record(&c.path, c.before);
+            } else {
+                lost.push(rel.clone());
+            }
+            if let Some(a) = &c.after {
+                self.vmem.wrote(&c.path, a);
+            }
+            names.push(format!("{rel}{}", if c.after.is_none() { " (deleted)" } else { "" }));
+        }
+        let n = names.len();
+        if n > 20 {
+            names.truncate(20);
+            names.push(format!("... {} more", n - 20));
+        }
+        o.text += &format!("\n[llmy: files changed by this command: {}]", names.join(", "));
+        o.summary += &format!(" · {n} file berubah");
+        if !lost.is_empty() {
+            self.send(Ev::Info(format!("Isi lama {} tidak tersimpan (terlalu besar); /undo tidak bisa mengembalikannya.", lost.join(", "))));
+        }
     }
 
     /// Jalankan pemeriksaan untuk file yang diubah di langkah ini. Hasilnya untuk model,
@@ -1016,6 +1185,8 @@ impl Agent {
 
 const SUMMARY: &str = "[Summary of the conversation so far]";
 
+const SUB_RULE: &str = "\n- You are a sub-agent. The main agent gave you one task and cannot see your messages, only your final reply. Do the task with the tools; there is no user to ask. Then reply with a short report: what you found or changed (with file paths), and anything not done.";
+
 /// Ukuran pesan tanpa salinan `blocks`/`parts` (isinya sama dengan content dan tool_calls) dan
 /// `reasoning` (umumnya tidak dikirim).
 fn size(m: &Value) -> usize {
@@ -1159,6 +1330,7 @@ fn shrink_inner(msgs: &mut Vec<Value>, limit: usize) -> (usize, usize) {
 fn detail(p: &Prepared) -> Detail {
     match &p.action {
         Action::Read { .. } | Action::Grep { .. } | Action::Essence { .. } => vec![],
+        Action::Task { task, .. } => task.lines().map(|l| (' ', 0, l.to_string())).collect(),
         Action::Web { lines, .. } => lines.iter().map(|l| (' ', 0, l.clone())).collect(),
         // Perintah selalu tampil utuh: pengguna menyetujui apa yang ia lihat.
         Action::Bash { cmd, .. } => cmd.lines().map(|l| ('$', 0, l.to_string())).collect(),

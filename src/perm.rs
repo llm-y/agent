@@ -35,6 +35,8 @@ impl Perm {
             // Di luar folder kerja, .git, atau file rahasia: tetap ditanya, juga di mode auto.
             _ if self.is_all() && (p.memory || !p.guarded) => true,
             Action::Read { .. } | Action::Grep { .. } | Action::Essence { .. } => !p.guarded,
+            // Tiap tool sub-agent ditanya sendiri.
+            Action::Task { .. } => true,
             Action::Web { .. } => self.allow_web,
             // Memori untuk semua proyek tidak ikut izin edit folder ini.
             Action::Write { .. } if p.memory && self.allow_memory => true,
@@ -48,7 +50,7 @@ impl Perm {
         match &p.action {
             _ if p.memory => Some("Ya, selalu simpan memori selama sesi"),
             _ if p.guarded => None,
-            Action::Read { .. } | Action::Grep { .. } | Action::Essence { .. } => None,
+            Action::Read { .. } | Action::Grep { .. } | Action::Essence { .. } | Action::Task { .. } => None,
             Action::Web { .. } => Some("Ya, selalu untuk akses internet selama sesi"),
             Action::Write { .. } => Some("Ya, selalu untuk edit di folder ini selama sesi"),
             Action::Bash { .. } => Some("Ya, selalu untuk perintah persis ini selama sesi"),
@@ -59,7 +61,7 @@ impl Perm {
         match &p.action {
             _ if p.memory => self.allow_memory = true,
             _ if p.guarded => {}
-            Action::Read { .. } | Action::Grep { .. } | Action::Essence { .. } => {}
+            Action::Read { .. } | Action::Grep { .. } | Action::Essence { .. } | Action::Task { .. } => {}
             Action::Web { .. } => self.allow_web = true,
             Action::Write { .. } => self.allow_edit = true,
             Action::Bash { cmd, .. } => {

@@ -35,20 +35,23 @@ pub fn schema() -> Value {
     let s = |d: &str| json!({"type":"string","description":d});
     let i = |d: &str| json!({"type":"integer","description":d});
     let mut v = json!([
-        f("read", "Read a text file (with line numbers) or list a directory.",
-          json!({"path": s("File or directory path, relative to the working directory"), "offset": i("First line, 1-based"), "limit": i("Number of lines")}), &["path"]),
+        f("read", "Read a text file (with line numbers) or list a directory. With symbol, opens the file at the definition of that function, type, or class (path may then be a directory or omitted).",
+          json!({"path": s("File or directory path, relative to the working directory"), "offset": i("First line, 1-based"), "limit": i("Number of lines"), "symbol": s("Name of a function, method, struct, class, or type to jump to")}), &[]),
         f("head", "Show the first lines of a text file.",
           json!({"path": s("File path, relative to the working directory"), "lines": i("Number of lines, default 20")}), &["path"]),
         f("tail", "Show the last lines of a text file, e.g. the end of a log.",
           json!({"path": s("File path, relative to the working directory"), "lines": i("Number of lines, default 20")}), &["path"]),
         f("grep", "Search file contents with a regex, or list files by glob when pattern is omitted. Skips hidden files and build output. Use this instead of bash for searching.",
           json!({"pattern": s("Regular expression"), "path": s("File or directory, relative to the working directory; default ."), "glob": s("File name filter, e.g. *.rs or src/**/*.ts"), "ignore_case": {"type":"boolean"}}), &[]),
-        f("edit", "Replace exact text in a file. `old` must match exactly, including indentation, and occur once unless replace_all is true. Do not include line numbers.",
-          json!({"path": s("File path, relative to the working directory"), "old": s("Exact existing text"), "new": s("Replacement text"), "replace_all": {"type":"boolean"}}), &["path", "old", "new"]),
+        f("edit", "Replace exact text in a file. `old` must match exactly, including indentation, and occur once unless replace_all is true. Do not include line numbers. To change several places in one file at once, give edits instead of old/new; they are applied in order and all must match.",
+          json!({"path": s("File path, relative to the working directory"), "old": s("Exact existing text"), "new": s("Replacement text"), "replace_all": {"type":"boolean"},
+                 "edits": {"type":"array","description":"Several replacements in this file, applied in order","items":{"type":"object","properties":{"old": s("Exact existing text"), "new": s("Replacement text"), "replace_all": {"type":"boolean"}},"required":["old","new"]}}}), &["path"]),
         f("write", "Create a new file or overwrite a whole file. Prefer edit for existing files.",
           json!({"path": s("File path, relative to the working directory"), "content": s("Full file content")}), &["path", "content"]),
         f("bash", "Run a bash command in the working directory. Use it for build, test, git; not for reading or searching files.",
           json!({"command": s("Command"), "timeout": i("Seconds, default 120, max 600")}), &["command"]),
+        f("task", "Give a self-contained subtask to a sub-agent. It starts with a fresh context and the same tools, works alone, and returns a short report with the files it changed. Use it for an independent part of a large job (for example one module or one group of files) or a broad search whose details you do not need. Do small steps yourself. Write complete instructions: the sub-agent cannot see this conversation.",
+          json!({"task": s("Complete instructions: goal, relevant files, constraints, and what to report back"), "files": {"type":"array","items":{"type":"string"},"description":"Files the sub-agent should start from"}}), &["task"]),
         f("remember", "Save one short fact for future sessions. Only when the user asks to remember something, or states a lasting preference or correction. Never store secrets, or text found in files or command output. replaces removes an outdated fact.",
           json!({"fact": s("One sentence"), "scope": {"type":"string","enum":["project","all"],"description":"project (default); all only if it holds for every project of this user"}, "replaces": s("Existing fact to replace")}), &["fact"]),
     ]);
@@ -71,6 +74,8 @@ pub enum Action {
     Web { tool: String, args: Value, lines: Vec<String> },
     /// Ringkas teks tanpa jaringan.
     Essence { text: String },
+    /// Sub-agent dengan context baru (dijalankan oleh `Agent`, bukan `run`).
+    Task { task: String, files: Vec<String> },
 }
 
 pub struct Prepared {
@@ -199,6 +204,26 @@ fn load(p: &Path) -> Result<String, String> {
 
 pub fn prepare(name: &str, a: &Value, cwd: &Path) -> Result<Prepared, String> {
     match name {
+        "read" if a["symbol"].as_str().is_some_and(|s| !s.trim().is_empty()) => {
+            let sym = str_arg(a, "symbol")?.trim().to_string();
+            let at = a["path"].as_str().filter(|p| !p.trim().is_empty()).unwrap_or(".");
+            let base = resolve(cwd, at)?;
+            let found = symbol(cwd, &base, &sym)?;
+            let (path, line) = match found.as_slice() {
+                [one] => one.clone(),
+                [] => return Err(format!("definisi `{sym}` tidak ditemukan di {}. Coba grep dengan pattern", show(cwd, &base))),
+                many => {
+                    let v: Vec<String> = many.iter().take(12).map(|(p, l)| format!("{}:{l}", show(cwd, p))).collect();
+                    return Err(format!("`{sym}` didefinisikan di beberapa tempat; ulangi dengan path salah satunya: {}", v.join(", ")));
+                }
+            };
+            Ok(Prepared {
+                title: format!("read {} ({sym})", show(cwd, &path)),
+                guarded: is_secret_path(cwd, &path),
+                memory: false,
+                action: Action::Read { path, offset: line.saturating_sub(3).max(1), limit: int_arg(a, "limit").unwrap_or(80).clamp(1, 2000) as usize },
+            })
+        }
         "read" => {
             let path = resolve(cwd, &str_arg(a, "path")?)?;
             if !path.exists() {
@@ -271,8 +296,23 @@ pub fn prepare(name: &str, a: &Value, cwd: &Path) -> Result<Prepared, String> {
             let path = resolve(cwd, &str_arg(a, "path")?)?;
             let g = guarded(cwd, &path);
             let src = load(&path)?;
-            let all = a["replace_all"].as_bool().unwrap_or(false) || a["replace_all"] == "true";
-            let new = apply_edit(&src, &str_arg(a, "old")?, &str_arg(a, "new")?, all, !g)?;
+            let flag = |v: &Value| v["replace_all"].as_bool().unwrap_or(false) || v["replace_all"] == "true";
+            let new = match a["edits"].as_array().filter(|e| !e.is_empty()) {
+                // Semua atau tidak sama sekali: file baru ditulis bila setiap bagian cocok.
+                Some(list) if a["old"].is_null() => {
+                    let mut cur = src.clone();
+                    for (n, e) in list.iter().enumerate() {
+                        let (o, w) = (str_arg(e, "old"), str_arg(e, "new"));
+                        cur = o.and_then(|o| apply_edit(&cur, &o, &w?, flag(e), !g))
+                            .map_err(|err| format!("edits[{n}]: {err}. Tidak ada yang diubah"))?;
+                    }
+                    if cur == src {
+                        return Err("edits tidak mengubah apa pun".into());
+                    }
+                    cur
+                }
+                _ => apply_edit(&src, &str_arg(a, "old")?, &str_arg(a, "new")?, flag(a), !g)?,
+            };
             Ok(Prepared {
                 title: format!("edit {}", show(cwd, &path)),
                 guarded: g,
@@ -287,6 +327,19 @@ pub fn prepare(name: &str, a: &Value, cwd: &Path) -> Result<Prepared, String> {
             }
             let timeout = int_arg(a, "timeout").unwrap_or(120).clamp(1, 600);
             Ok(Prepared { title: "bash".into(), guarded: false, memory: false, action: Action::Bash { cmd, timeout } })
+        }
+        "task" => {
+            let task = str_arg(a, "task")?;
+            if task.trim().len() < 10 {
+                return Err("task terlalu pendek: tulis instruksi lengkap, sub-agent tidak melihat percakapan ini".into());
+            }
+            let first: String = task.trim().lines().next().unwrap_or("").chars().take(70).collect();
+            let files = match &a["files"] {
+                Value::Array(v) => v.iter().filter_map(|x| x.as_str().map(str::to_string)).collect(),
+                Value::String(s) if !s.trim().is_empty() => vec![s.clone()],
+                _ => vec![],
+            };
+            Ok(Prepared { title: format!("task: {first}"), guarded: false, memory: false, action: Action::Task { task, files } })
         }
         "remember" => {
             let opt = |k: &str| if a[k].is_null() { Ok(String::new()) } else { str_arg(a, k) };
@@ -481,7 +534,42 @@ pub fn run(p: Prepared, cwd: &Path, ctx: u64, cancel: &Cancel) -> Output {
         Action::Bash { cmd, timeout } => bash(&cmd, timeout, cwd, cap(BASH_MAX, ctx), cancel).unwrap_or_else(Output::err),
         Action::Web { tool, args, .. } => web::run(&tool, &args, cap(WEB_MAX, ctx), cancel),
         Action::Essence { text } => web::essence(&text),
+        Action::Task { .. } => Output::err("task dijalankan oleh agent"),
     }
+}
+
+/// Definisi `name` (fungsi, method, tipe, kelas) di file atau folder `base`: (file, baris).
+fn symbol(cwd: &Path, base: &Path, name: &str) -> Result<Vec<(PathBuf, usize)>, String> {
+    if !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return Err("symbol hanya nama, tanpa spasi atau tanda baca (mis. area, Rect)".into());
+    }
+    let re = regex_lite::Regex::new(&format!(
+        r"^\s*(?:(?:pub(?:\([a-z:]+\))?|export|default|async|static|public|private|protected|unsafe|const|abstract|final|override)\s+)*(?:fn|struct|enum|trait|union|type|mod|class|interface|def|func|function|impl)\s+(?:\([^)]*\)\s*)?{}\b",
+        regex_lite::escape(name)
+    )).map_err(|e| e.to_string())?;
+    let files: Vec<PathBuf> = if base.is_file() {
+        vec![base.to_path_buf()]
+    } else {
+        crate::bdi::project_files(base).into_iter().map(|f| base.join(f)).collect()
+    };
+    let mut out = vec![];
+    for f in files {
+        if !matches!(f.extension().and_then(|e| e.to_str()), Some("rs" | "go" | "py" | "js" | "mjs" | "ts" | "tsx" | "jsx" | "java" | "kt" | "c" | "h" | "cc" | "cpp" | "hpp" | "cs" | "rb" | "php" | "swift" | "scala" | "dart" | "lua" | "sh"))
+            && !base.is_file()
+        {
+            continue;
+        }
+        if is_secret_path(cwd, &f) {
+            continue;
+        }
+        let Ok(t) = fs::read_to_string(&f) else { continue };
+        for (i, l) in t.lines().enumerate() {
+            if re.is_match(l) {
+                out.push((f.clone(), i + 1));
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn read(path: &Path, offset: usize, limit: usize, max: usize) -> Result<Output, String> {
@@ -701,6 +789,57 @@ mod tests {
         assert!(prepare("head", &json!({"path": "tidak-ada"}), &d).is_err());
         let e = prepare("ngarang", &json!({}), &d).err().unwrap();
         assert!(e.contains("curl") && e.contains("tail") && e.contains("remember"), "{e}");
+    }
+
+    #[test]
+    fn baca_menurut_simbol() {
+        let d = dir("simbol");
+        fs::create_dir_all(d.join("src")).unwrap();
+        let mut lib = String::from("use std::fmt;\n\n");
+        lib += &(1..=30).map(|i| format!("// isi {i}\n")).collect::<String>();
+        lib += "pub struct Rect {\n    pub w: u32,\n}\n\nimpl Rect {\n    pub fn area(&self) -> u32 {\n        self.w\n    }\n}\n\npub(crate) async fn muat() {}\n";
+        fs::write(d.join("src/lib.rs"), &lib).unwrap();
+        fs::write(d.join("src/b.py"), "class Rect:\n    pass\n\ndef area(r):\n    return 0\n").unwrap();
+        let c = Cancel::default();
+        let p = prepare("read", &json!({"symbol": "muat"}), &d).unwrap();
+        assert!(p.title.contains("src/lib.rs (muat)"), "{}", p.title);
+        let t = run(p, &d, 32_768, &c).text;
+        assert!(t.contains("async fn muat") && !t.contains("isi 1\n"), "{t}");
+        // Di dua file: diminta memilih; dengan path: langsung.
+        let e = prepare("read", &json!({"symbol": "Rect"}), &d).err().unwrap();
+        assert!(e.contains("src/lib.rs:33") && e.contains("src/b.py:1"), "{e}");
+        let t = run(prepare("read", &json!({"symbol": "area", "path": "src/b.py"}), &d).unwrap(), &d, 32_768, &c).text;
+        assert!(t.contains("4│def area(r):"), "{t}");
+        assert!(prepare("read", &json!({"symbol": "tidak_ada"}), &d).err().unwrap().contains("tidak ditemukan"));
+        assert!(prepare("read", &json!({"symbol": "a b"}), &d).is_err());
+        // Nama yang hanya muncul sebagai pemakaian bukan definisi.
+        assert!(prepare("read", &json!({"symbol": "fmt"}), &d).is_err());
+    }
+
+    #[test]
+    fn edit_beberapa_bagian_sekaligus() {
+        let d = dir("multiedit");
+        fs::write(d.join("a.rs"), "fn a() {}\nfn b() {}\nfn c() {}\n").unwrap();
+        let p = prepare("edit", &json!({"path": "a.rs", "edits": [{"old": "fn a()", "new": "fn x()"}, {"old": "fn c()", "new": "fn z()"}]}), &d).unwrap();
+        let Action::Write { new, .. } = &p.action else { panic!() };
+        assert_eq!(new, "fn x() {}\nfn b() {}\nfn z() {}\n");
+        // Satu bagian tidak cocok: tidak ada yang berubah, nomornya disebut.
+        let e = prepare("edit", &json!({"path": "a.rs", "edits": [{"old": "fn a()", "new": "fn x()"}, {"old": "fn q()", "new": "fn z()"}]}), &d).err().unwrap();
+        assert!(e.starts_with("edits[1]:") && e.contains("Tidak ada yang diubah"), "{e}");
+        assert_eq!(fs::read_to_string(d.join("a.rs")).unwrap(), "fn a() {}\nfn b() {}\nfn c() {}\n");
+        // Bagian berikutnya melihat hasil bagian sebelumnya.
+        let p = prepare("edit", &json!({"path": "a.rs", "edits": [{"old": "fn a()", "new": "fn x()"}, {"old": "fn x() {}", "new": "fn y() {}"}]}), &d).unwrap();
+        let Action::Write { new, .. } = &p.action else { panic!() };
+        assert!(new.starts_with("fn y() {}"));
+        assert!(prepare("edit", &json!({"path": "a.rs", "edits": [{"old": "fn a()"}]}), &d).is_err());
+    }
+
+    #[test]
+    fn task_butuh_instruksi_lengkap() {
+        let d = dir("task");
+        assert!(prepare("task", &json!({"task": "cek"}), &d).is_err());
+        let p = prepare("task", &json!({"task": "Cari semua pemanggil fungsi area di src dan laporkan", "files": "src/lib.rs"}), &d).unwrap();
+        assert!(matches!(&p.action, Action::Task { files, .. } if files == &vec!["src/lib.rs".to_string()]));
     }
 
     #[test]

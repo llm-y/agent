@@ -7,7 +7,8 @@ Simpan dan pilih API dari beberapa provider lewat `llmy api set` (disimpan di `~
 hanya terbaca pemilik) atau `/api` di dalam sesi. Memori cukup di `AGENTS.md`: bagian `## Memory`
 milik proyek, atau `~/.config/llmy/AGENTS.md` yang terbawa ke semua proyek. Tanpa database.
 
-Tool: `read`, `head`, `tail`, `grep`, `edit`, `write`, `bash`, `essence`, `remember`, dan tool internet
+Tool: `read` (juga per simbol), `head`, `tail`, `grep`, `edit` (juga beberapa bagian sekaligus), `write`,
+`bash`, `task` (sub-agent dengan context baru), `essence`, `remember`, dan tool internet
 `curl`, `github`, `openalex`, `doi`, `spider`; `tavily`, `exa`, `linkup`, `firecrawl`, `scopus`, dan
 `brightdata` muncul bila kuncinya ada di env. Setiap tindakan ditanya, kecuali dengan `--allow` atau
 mode auto (`--auto`, `/auto`, Shift+Tab).
@@ -22,7 +23,7 @@ dipasang lewat menu `llmy setup`, atau cukup lewat env kuncinya (`GROQ_API_KEY`,
 
 Alur bawaan: satu loop, satu model. `--mode bdi` membagi kerja: perencana (bisa model lain, `--plan`)
 memecah tugas, tiap tujuan dikerjakan pekerja dengan context baru, llmy memverifikasi, dan file
-dikembalikan bila buntu.
+dikembalikan bila buntu. `/undo` mengembalikan file yang diubah giliran terakhir, termasuk lewat `bash`.
 
 Instalasi dan manual: <https://ll.my.id>
 

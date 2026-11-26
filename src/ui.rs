@@ -28,13 +28,14 @@ const SPIN: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'
 /// berjalan tidak ikut menyetujui.
 const ASK_GUARD: Duration = Duration::from_millis(500);
 
-const COMMANDS: [(&str, &str); 12] = [
+const COMMANDS: [(&str, &str); 13] = [
     ("/help", "bantuan"),
     ("/model", "lihat atau ganti model"),
     ("/api", "atur atau pilih API provider"),
     ("/think", "aktif/nonaktifkan thinking"),
     ("/auto", "mode auto: setujui semua tanpa tanya (juga Shift+Tab)"),
     ("/mode", "alur kerja: loop (satu model) atau bdi (perencana + pekerja)"),
+    ("/undo", "kembalikan file yang diubah giliran terakhir"),
     ("/compact", "ringkas percakapan untuk menghemat context"),
     ("/remember", "simpan fakta: /remember <fakta> atau /remember all <fakta>"),
     ("/memory", "lihat memori proyek dan semua proyek"),
@@ -673,6 +674,7 @@ impl Ui {
             "/exit" | "/quit" => self.quit = true,
             "/clear" => self.start(Cmd::Clear),
             "/compact" => self.start(Cmd::Compact),
+            "/undo" => self.start(Cmd::Undo),
             "/think" => self.start(Cmd::Think),
             "/remember" if arg.trim().is_empty() => self.lines(DIM, "  ", "Pakai: /remember <fakta> (proyek ini) atau /remember all <fakta> (semua proyek)"),
             "/remember" => self.start(Cmd::Remember(arg.trim().into())),

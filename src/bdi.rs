@@ -386,6 +386,8 @@ impl Agent {
     /// Kembalikan file ke isi sebelum intention. File baru dihapus.
     fn rollback(&mut self) -> usize {
         let snap = self.snap.take().unwrap_or_default();
+        // Pindaian folder lama tidak berlaku lagi.
+        self.tree = None;
         let mut n = 0;
         for (p, old) in snap {
             let now = std::fs::read_to_string(&p).ok();
@@ -510,14 +512,22 @@ fn git(cwd: &Path, args: &[&str]) -> String {
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default()
 }
 
-/// Daftar file proyek dengan nama simbol tingkat atas; dari `git ls-files`, atau berjalan
-/// sendiri tanpa folder tersembunyi dan folder build.
-pub fn repo_map(cwd: &Path) -> String {
-    let mut files: Vec<String> = git(cwd, &["ls-files", "--cached", "--others", "--exclude-standard"]).lines().map(String::from).collect();
+/// File proyek relatif terhadap `cwd`: dari `git ls-files`, atau berjalan sendiri tanpa folder
+/// tersembunyi dan folder build. Paling banyak 2000.
+pub fn project_files(cwd: &Path) -> Vec<String> {
+    let mut files: Vec<String> = git(cwd, &["ls-files", "--cached", "--others", "--exclude-standard", "."]).lines().map(String::from).collect();
     if files.is_empty() {
         walk(cwd, cwd, &mut files, 0);
     }
+    files.retain(|f| cwd.join(f).is_file());
     files.sort();
+    files.truncate(2000);
+    files
+}
+
+/// Daftar file proyek dengan nama simbol tingkat atas.
+pub fn repo_map(cwd: &Path) -> String {
+    let mut files = project_files(cwd);
     files.truncate(400);
     let re = regex_lite::Regex::new(r"^\s*(?:pub(?:\([a-z]+\))?\s+)?(?:export\s+)?(?:async\s+)?(?:fn|struct|enum|trait|impl|class|def|func|function|interface|type)\s+([A-Za-z_][A-Za-z0-9_]*)").unwrap();
     let mut out = String::new();
@@ -549,7 +559,7 @@ pub fn repo_map(cwd: &Path) -> String {
 fn walk(root: &Path, dir: &Path, out: &mut Vec<String>, depth: usize) {
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     for e in rd.flatten() {
-        if out.len() >= 400 {
+        if out.len() >= 2000 {
             return;
         }
         let name = e.file_name().to_string_lossy().into_owned();
