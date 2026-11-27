@@ -48,7 +48,7 @@ pub struct Free {
 
 // Diperiksa dengan dokumentasi resmi pada 2026-11-26; ID model cepat berganti, jadi daftar
 // dari server didahulukan dan yang di sini hanya saran.
-pub const FREE: [Free; 15] = [
+pub const FREE: [Free; 10] = [
     Free {
         name: "groq", kind: Kind::OpenAi, env: &["GROQ_API_KEY"], keyless: false,
         label: "Groq", base: "https://api.groq.com/openai/v1", list: None, check: None, public_list: false,
@@ -70,13 +70,6 @@ pub const FREE: [Free; 15] = [
         key_url: "https://openrouter.ai/keys", key_hint: "sk-or-v1-",
         models: &["nvidia/nemotron-3-ultra-550b-a55b:free", "google/gemma-4-31b-it:free"],
         only_free: true, note: "model :free berganti-ganti; 20 permintaan per menit, 50 per hari",
-    },
-    Free {
-        name: "mistral", kind: Kind::OpenAi, env: &["MISTRAL_API_KEY"], keyless: false,
-        label: "Mistral AI", base: "https://api.mistral.ai/v1", list: None, check: None, public_list: false,
-        key_url: "https://admin.mistral.ai/organization/api-keys", key_hint: "",
-        models: &["mistral-large-4-0", "mistral-medium-latest", "mistral-small-latest"],
-        only_free: false, note: "BUKAN gratis lagi: API butuh aktivasi billing (pay-as-you-go)",
     },
     Free {
         name: "cohere", kind: Kind::OpenAi, env: &["COHERE_API_KEY"], keyless: false,
@@ -131,34 +124,6 @@ pub const FREE: [Free; 15] = [
         key_url: "https://app.kilo.ai (opsional; tanpa kunci pun jalan)", key_hint: "",
         models: &["nvidia/nemotron-3-ultra-550b-a55b:free", "nvidia/nemotron-3.5-lightning:free", "kilo-auto/free"],
         only_free: true, note: "model :free tanpa akun, 200 permintaan per jam per IP; sebagian melatih dari prompt",
-    },
-    Free {
-        name: "sambanova", kind: Kind::OpenAi, env: &["SAMBANOVA_API_KEY"], keyless: false,
-        label: "SambaNova Cloud", base: "https://api.sambanova.ai/v1", list: None, check: None, public_list: true,
-        key_url: "https://cloud.sambanova.ai/apis", key_hint: "",
-        models: &["gpt-oss-120b", "gemma-4-31B-it"],
-        only_free: false, note: "kunci baru ditolak (402) sampai metode bayar ditambahkan (diuji 2026-11-27)",
-    },
-    Free {
-        name: "ovh", kind: Kind::OpenAi, env: &["OVH_AI_ENDPOINTS_ACCESS_TOKEN"], keyless: true,
-        label: "OVHcloud AI Endpoints (tanpa akun)", base: "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1", list: None, check: None, public_list: true,
-        key_url: "tanpa kunci gratis; kunci OVH berbayar (Public Cloud → AI Endpoints)", key_hint: "",
-        models: &["gpt-oss-120b", "Qwen3.6-27B", "Meta-Llama-3_3-70B-Instruct"],
-        only_free: false, note: "tanpa akun: server membalas 429 dengan batas 1 permintaan per tahun (diuji 2026-11-27); kunci OVH berbayar",
-    },
-    Free {
-        name: "modelscope", kind: Kind::OpenAi, env: &["MODELSCOPE_API_KEY"], keyless: false,
-        label: "ModelScope (Tiongkok)", base: "https://api-inference.modelscope.cn/v1", list: None, check: None, public_list: true,
-        key_url: "https://modelscope.cn/my/myaccesstoken", key_hint: "ms-",
-        models: &["ZhipuAI/GLM-4.7-Flash", "Qwen/Qwen3.5-35B-A3B"],
-        only_free: false, note: "butuh akun Alibaba Cloud terverifikasi; non-komersial; tool belum diperiksa",
-    },
-    Free {
-        name: "llm7", kind: Kind::OpenAi, env: &["LLM7_API_KEY"], keyless: true,
-        label: "LLM7.io (tanpa akun)", base: "https://api.llm7.io/v1", list: None, check: None, public_list: true,
-        key_url: "https://dash.llm7.io (opsional)", key_hint: "",
-        models: &["codestral-latest"],
-        only_free: false, note: "tanpa akun, batas tidak dipublikasikan dan ketat; model berganti",
     },
 ];
 

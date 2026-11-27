@@ -354,7 +354,7 @@ impl Provider {
                 return Err(format!("{name} tidak dikirim lewat http ke {}; pakai https", self.base));
             }
             Some(h) => v.push(h),
-            // Provider yang memang bisa dipakai tanpa akun (Kilo, OVH, LLM7).
+            // Provider yang memang bisa dipakai tanpa akun (Kilo).
             None if free.is_some_and(|f| f.keyless) => {}
             None if !local && !lan => {
                 return Err(format!(
@@ -614,7 +614,7 @@ mod tests {
             let p = Provider::with_options(name, None, None, None, sess).unwrap();
             p.explain(Fail { status: 401, msg: "HTTP 401: ditolak".into(), retry_after: None, no_retry: false, location: None })
         };
-        assert!(f("modelscope/ZhipuAI/GLM-4.7-Flash").ends_with("(periksa MODELSCOPE_API_KEY atau /api)"));
+        assert!(f("zai/glm-4.7-flash").ends_with("(periksa ZAI_API_KEY atau /api)"));
         assert!(f("groq/openai/gpt-oss-120b").contains("GROQ_API_KEY"));
         assert!(f("openai/gpt-x").contains("OPENAI_API_KEY"));
     }

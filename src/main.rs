@@ -49,7 +49,7 @@ Pakai:
   llmy api [perintah]      atur API beberapa provider (set, list, use, remove)
   llmy stats               ringkasan metrik lokal per giliran (LLMY_METRICS=off mematikan)
   llmy setup               pasang provider gratis lewat menu: Groq, Cerebras, OpenRouter (:free),
-                           Mistral, Cohere, NVIDIA NIM, Cloudflare Workers AI
+                           Cohere, NVIDIA NIM, Cloudflare Workers AI, Z.ai, Gemini, Kilo
 
 Opsi:
   -m, --model <nama>   model (env LLMY_MODEL, bawaan qwen3.5:9b atau profil bawaan)

@@ -17,8 +17,8 @@ Bahasa utama: Rust, JavaScript (croot.js), LaTeX, dan Python. Setelah edit, llmy
 pemeriksaan proyek (`cargo check`, `node --check`, kompilasi draft LaTeX, `py_compile`, juga `go build`, `tsc`,
 atau `--verify <perintah>`) dan memberikan galatnya ke model. Isi file yang sudah gagal ditolak bila ditulis lagi.
 
-Provider gratis (Groq, Cerebras, OpenRouter `:free`, Mistral, Cohere, NVIDIA NIM, Cloudflare Workers AI,
-Z.ai dan Zhipu BigModel (GLM Flash), Google AI Studio, Kilo, SambaNova, OVHcloud, ModelScope, LLM7) bisa
+Provider gratis (Groq, Cerebras, OpenRouter `:free`, Cohere, NVIDIA NIM, Cloudflare Workers AI,
+Z.ai dan Zhipu BigModel (GLM Flash), Google AI Studio, Kilo) bisa
 dipasang lewat menu `llmy setup`, atau cukup lewat env kuncinya (`GROQ_API_KEY`, `ZAI_API_KEY`, ...).
 `--fallback a,b` berpindah ke model lain saat kuota habis.
 
