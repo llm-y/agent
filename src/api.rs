@@ -40,7 +40,6 @@ pub fn preset(name: &str) -> Option<(Kind, String)> {
         "anthropic" => (Kind::Anthropic, anthropic::BASE),
         "openai" => (Kind::OpenAi, openai::BASE),
         "gemini" => (Kind::Gemini, gemini::BASE),
-        "deepseek" => (Kind::OpenAi, "https://api.deepseek.com"),
         "xai" => (Kind::OpenAi, "https://api.x.ai/v1"),
         // Provider gratis dari `llmy setup`. Cloudflare butuh Account ID di alamatnya: dari
         // CLOUDFLARE_ACCOUNT_ID, atau dari `llmy setup`.
@@ -54,6 +53,15 @@ pub fn preset(name: &str) -> Option<(Kind, String)> {
         }
     };
     Some((k, u.into()))
+}
+
+/// Env kunci preset berbayar yang bukan bawaan dan bukan dari `llmy setup`. Kunci OPENAI_API_KEY
+/// tidak boleh terkirim ke sana.
+pub fn preset_env(name: &str) -> Option<&'static str> {
+    match name {
+        "xai" => Some("XAI_API_KEY"),
+        _ => None,
+    }
 }
 
 pub fn is_builtin(name: &str) -> bool {
@@ -446,7 +454,7 @@ const API_HELP: &str = "Pengaturan API multi-provider:
 Contoh:
   llmy api set anthropic --key sk-ant-... --model claude-opus-5-5
   llmy api set gemini --key AIza... --model gemini-2.5-flash
-  llmy api set deepseek --key sk-... --model deepseek-chat --default
+  llmy api set deepseek --key sk-... --model deepseek-flash --default
   llmy api set vllm --protocol openai --url http://192.168.1.5:8000/v1 --no-key --model qwen";
 
 /// `a, b,c` -> [a, b, c].

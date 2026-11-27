@@ -48,7 +48,7 @@ pub struct Free {
 
 // Diperiksa dengan dokumentasi resmi pada 2026-11-26; ID model cepat berganti, jadi daftar
 // dari server didahulukan dan yang di sini hanya saran.
-pub const FREE: [Free; 10] = [
+pub const FREE: [Free; 11] = [
     Free {
         name: "groq", kind: Kind::OpenAi, env: &["GROQ_API_KEY"], keyless: false,
         label: "Groq", base: "https://api.groq.com/openai/v1", list: None, check: None, public_list: false,
@@ -124,6 +124,13 @@ pub const FREE: [Free; 10] = [
         key_url: "https://app.kilo.ai (opsional; tanpa kunci pun jalan)", key_hint: "",
         models: &["nvidia/nemotron-3-ultra-550b-a55b:free", "nvidia/nemotron-3.5-lightning:free", "kilo-auto/free"],
         only_free: true, note: "model :free tanpa akun, 200 permintaan per jam per IP; sebagian melatih dari prompt",
+    },
+    Free {
+        name: "deepseek", kind: Kind::OpenAi, env: &["DEEPSEEK_API_KEY"], keyless: false,
+        label: "DeepSeek (berbayar)", base: "https://api.deepseek.com", list: None, check: None, public_list: false,
+        key_url: "https://platform.deepseek.com/api_keys", key_hint: "sk-",
+        models: &["deepseek-flash", "deepseek-v4-pro"],
+        only_free: false, note: "BERBAYAR, tanpa tier gratis: isi saldo dulu; deepseek-flash murah, separuh harga di luar jam sibuk",
     },
 ];
 

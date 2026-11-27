@@ -243,6 +243,8 @@ impl Provider {
             // Provider gratis: hanya dari env miliknya sendiri, misalnya GROQ_API_KEY. Kunci
             // OPENAI_API_KEY tidak boleh terkirim ke provider lain.
             (f.env.iter().find_map(|e| env(e)), false)
+        } else if let Some(e) = api::preset_env(&profile) {
+            (env(e), false)
         } else {
             env_key(kind)
         };
@@ -328,7 +330,7 @@ impl Provider {
     /// Env tempat kunci profil ini dibaca: provider gratis memakai env miliknya (GROQ_API_KEY, ...).
     fn key_name(&self) -> &'static str {
         let free = crate::setup::find(&self.profile).filter(|_| !api::is_builtin(&self.profile));
-        free.map_or(env_key_name(self.kind), |f| f.env[0])
+        free.map(|f| f.env[0]).or(api::preset_env(&self.profile)).unwrap_or(env_key_name(self.kind))
     }
 
     pub fn headers(&self) -> Result<Vec<(&'static str, String)>, String> {

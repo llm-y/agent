@@ -18,7 +18,7 @@ pemeriksaan proyek (`cargo check`, `node --check`, kompilasi draft LaTeX, `py_co
 atau `--verify <perintah>`) dan memberikan galatnya ke model. Isi file yang sudah gagal ditolak bila ditulis lagi.
 
 Provider gratis (Groq, Cerebras, OpenRouter `:free`, Cohere, NVIDIA NIM, Cloudflare Workers AI,
-Z.ai dan Zhipu BigModel (GLM Flash), Google AI Studio, Kilo) bisa
+Z.ai dan Zhipu BigModel (GLM Flash), Google AI Studio, Kilo, serta DeepSeek yang berbayar) bisa
 dipasang lewat menu `llmy setup`, atau cukup lewat env kuncinya (`GROQ_API_KEY`, `ZAI_API_KEY`, ...).
 `--fallback a,b` berpindah ke model lain saat kuota habis.
 
