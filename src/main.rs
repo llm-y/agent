@@ -6,6 +6,7 @@ mod cancel;
 mod detect;
 mod editor;
 mod gemini;
+mod git;
 mod grep;
 mod http;
 mod iface;
@@ -242,6 +243,13 @@ fn main() {
         (Some(id), Some(s)) => s.resume(id.as_deref()).unwrap_or_else(|e| die(&e)),
         (Some(_), None) => die("--continue/--resume tidak bisa dipakai tanpa penyimpanan sesi"),
     };
+    // Git wajib (2026-11-28): snapshot, versi terbaik, dan pembanding antarmuka memakai repo folder kerja.
+    let sid = session.as_mut().and_then(Session::id).unwrap_or_else(|| format!("p{}", std::process::id()));
+    let (repo, git_note) = match git::open(&cwd, &sid) {
+        Ok(git::Open::Repo(r)) => (Some(r), None),
+        Ok(git::Open::Skipped(why)) => (None, Some(why)),
+        Err(e) => die(&e),
+    };
     let c = cancel.clone();
     sys::on_signal(move || {
         c.cancel();
@@ -253,6 +261,10 @@ fn main() {
     let mut agent = Agent::new(provider, o.perm, interactive, cwd.clone(), cancel.clone(), tx.clone())
         .with_verify(o.verify)
         .with_session(session, history);
+    agent.repo = repo;
+    if let Some(n) = git_note {
+        let _ = tx.send(agent::Ev::Info(n));
+    }
     (agent.flow, agent.planner, agent.fallback, agent.subagent) = (o.flow, planner, o.fallback, subagent);
     let (ctx, crx) = channel();
     std::thread::spawn(move || agent.serve(crx));

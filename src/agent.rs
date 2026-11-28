@@ -126,6 +126,8 @@ pub struct Agent {
     pub map: bool,
     /// Penjaga antarmuka (`iface.rs`; `LLMY_IFACE=off` mematikan, untuk ablasi).
     pub iface: bool,
+    /// Repo git folder kerja (`git.rs`): snapshot tiap giliran dan tiap skor uji, isi asli sesi, versi terbaik.
+    pub repo: Option<crate::git::Repo>,
     /// File yang sudah dibaca (atau ditulis) di proses ini: `write` utuh atas file lain yang sudah ada ditolak.
     seen: std::collections::HashSet<PathBuf>,
     /// Deteksi siklus 2–4 panggilan dengan hasil sama (`LLMY_CYCLE=off` mematikan).
@@ -244,7 +246,7 @@ impl Agent {
             cycle: crate::provider::env("LLMY_CYCLE").is_none_or(|v| v != "off"),
             budget: crate::provider::env("LLMY_BUDGET").and_then(|v| v.parse::<u64>().ok()).filter(|s| *s > 0)
                 .map(|s| (std::time::Instant::now(), std::time::Duration::from_secs(s))),
-            wrapped: false, seen: Default::default(),
+            wrapped: false, seen: Default::default(), repo: None,
         };
         // JSON skema + pembungkus per provider (perkiraan).
         a.schema_bytes = a.tools.to_string().len() * 11 / 10;
@@ -631,6 +633,9 @@ impl Agent {
     pub(crate) fn run(&mut self, text: String) -> End {
         let wish = if self.sub { None } else { memory::wish(user_part(&text)) };
         self.push(json!({"role":"user","content":text}));
+        if !self.sub && let Some(r) = &mut self.repo {
+            r.snapshot(&format!("giliran: {}", user_part(&text).chars().take(72).collect::<String>().replace('\n', " ")));
+        }
         let mut history: Vec<String> = vec![];
         // Jejak (tool, argumen, hasil) untuk deteksi siklus; dan berapa kali siklus sudah diperingatkan.
         let mut trail: Vec<u64> = vec![];
@@ -828,6 +833,9 @@ impl Agent {
                     o.text += &format!("\n\n[llmy: the last {} calls repeat the same {p}-call sequence with identical results. This is a loop. Stop repeating it: change approach, or explain what is blocking you.]", 3 * p);
                 }
             }
+            if !self.sub && !stop && let Some((t0, b)) = self.budget && t0.elapsed() >= b.mul_f32(0.95) {
+                return self.stuck("Berhenti: batas waktu LLMY_BUDGET hampir habis.".into());
+            }
             if !self.sub && !self.wrapped && let Some((t0, b)) = self.budget && t0.elapsed() >= b.mul_f32(0.8) {
                 self.wrapped = true;
                 if let Some(o) = outs.last_mut() {
@@ -873,9 +881,36 @@ impl Agent {
 
     /// Macet: error akhir di mode loop; di pekerja BDI hanya catatan, karena orkestrator yang
     /// memutuskan langkah berikutnya.
-    fn stuck(&mut self, e: String) -> End {
+    fn stuck(&mut self, mut e: String) -> End {
+        if !self.sub && let Some(n) = self.restore_best() {
+            e += &format!(" {n}");
+        }
         self.send(if self.sub { Ev::Info(e.clone()) } else { Ev::Error(e.clone()) });
         End::Stuck(e)
+    }
+
+    /// Macet setelah keadaan memburuk: file yang diubah llmy di sesi ini dikembalikan ke snapshot dengan uji lulus
+    /// terbanyak (`git.rs`). Hanya file llmy; perubahan pengguna di file lain tidak disentuh.
+    fn restore_best(&mut self) -> Option<String> {
+        let r = self.repo.as_mut()?;
+        let (bp, bf, best) = r.best.clone()?;
+        let now = r.now?;
+        if !crate::git::better((bp, bf), now) {
+            return None;
+        }
+        let cur = r.snapshot("sebelum kembali ke versi terbaik")?;
+        // Hanya file yang diubah tool llmy (write/edit/bash) di sesi ini; bukan semua yang berbeda di git.
+        let mine: std::collections::BTreeSet<&PathBuf> = self.touched.iter().chain(self.turn_log.keys()).collect();
+        let paths: Vec<PathBuf> = r.changed(&best, &cur).into_iter().filter(|p| mine.contains(p)).collect();
+        if paths.is_empty() {
+            return None;
+        }
+        let done = r.restore(&best, &paths);
+        r.now = Some((bp, bf));
+        r.snapshot(&format!("kembali ke versi terbaik: {bp} lulus, {bf} gagal"));
+        self.stat.restored += 1;
+        let names: Vec<String> = done.iter().map(|p| p.strip_prefix(&self.cwd).unwrap_or(p).display().to_string()).collect();
+        Some(format!("llmy mengembalikan {} ke versi dengan uji lulus terbanyak ({bp} lulus, {bf} gagal; terakhir {} lulus, {} gagal).", names.join(", "), now.0, now.1))
     }
 
     /// Pindah ke model cadangan berikutnya bila kegagalan terakhir berupa kuota/server.
@@ -1233,6 +1268,7 @@ impl Agent {
             Action::Bash { cmd, .. } if reads_only(cmd) => self.turn_files(cmd),
             _ => vec![],
         };
+        let test_cmd = matches!(&p.action, Action::Bash { cmd, .. } if crate::git::is_test(cmd));
         let mut o = tools::run(p, &self.cwd, self.provider.ctx, &self.cancel);
         if o.ok {
             self.seen.extend(read);
@@ -1242,6 +1278,9 @@ impl Agent {
             let changes = track::diff(&before, &after);
             self.tree = Some(after);
             self.bash_changes(changes, &mut o);
+        }
+        if test_cmd && !self.sub && let (Some(s), Some(r)) = (crate::git::score(&o.text), &mut self.repo) {
+            r.scored(s);
         }
         if o.ok
             && let Some((path, new)) = written
@@ -1309,8 +1348,8 @@ impl Agent {
                  if you still must)."
             ));
         }
-        let base = self.turn_log.get(path).cloned().flatten().unwrap_or_else(|| old.clone());
-        crate::iface::to_cjs(path, &base, new).then(|| crate::iface::cjs_error(path, &base))
+        // Yang ditolak perpindahannya sekarang: file yang sudah CommonJS (permintaan pengguna) tetap boleh diubah.
+        crate::iface::to_cjs(path, old, new).then(|| crate::iface::cjs_error(path, old))
     }
 
     /// File di folder kerja yang namanya muncul di perintah baca `bash` (mis. `cat a.js`).
@@ -1327,8 +1366,13 @@ impl Agent {
         if !self.iface {
             return None;
         }
-        let old = self.turn_log.get(path)?.as_deref()?;
-        let n = crate::iface::check(path, old, new)?;
+        // Pembanding: isi file saat sesi dimulai (snapshot git; tetap berlaku untuk `-c`), atau awal giliran.
+        let from_git = self.repo.as_ref().and_then(|r| r.show(r.base.as_ref()?, path));
+        let old = match from_git {
+            Some(s) => s,
+            None => self.turn_log.get(path)?.clone()?,
+        };
+        let n = crate::iface::check(path, &old, new)?;
         self.stat.iface_warn += 1;
         Some(n)
     }
@@ -1377,9 +1421,14 @@ impl Agent {
             self.send(Ev::Tool { title: "uji proyek".into(), detail: run.iter().map(|(_, c)| ('$', 0, c.chars().take(160).collect())).collect() });
         }
         let (mut failed, mut gone) = (vec![], vec![]);
+        let mut score: Option<(usize, usize)> = None;
         for (i, cmd) in &run {
             let p = Prepared { action: Action::Bash { cmd: cmd.clone(), timeout: 600 }, title: "uji".into(), guarded: false, memory: false };
             let o = tools::run(p, &self.gates[*i].dir, self.provider.ctx, &self.cancel);
+            if let Some((a, b)) = crate::git::score(&o.text) {
+                let s = score.unwrap_or((0, 0));
+                score = Some((s.0 + a, s.1 + b));
+            }
             if self.cancel.is_set() {
                 self.send(Ev::ToolDone { ok: false, summary: "dibatalkan".into() });
                 return GateEnd::Skip;
@@ -1395,6 +1444,9 @@ impl Agent {
         }
         for i in gone.iter().rev() {
             self.gates.remove(*i);
+        }
+        if let (Some(s), Some(r)) = (score, &mut self.repo) {
+            r.scored(s);
         }
         if failed.is_empty() {
             self.stat.gate_pass += 1;

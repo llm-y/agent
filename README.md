@@ -30,6 +30,8 @@ Harness: saat model menyatakan selesai, llmy menjalankan uji proyek dan mengemba
 galat pemeriksaan disertai potongan kode di lokasinya (16 tugas, qwen3.5:9b: 33/48 → 45/48 benar); peta proyek
 opsional (`LLMY_MAP=on`); `edit` toleran indentasi; penjaga antarmuka (tulis ulang file yang belum dibaca dan
 `export` -> `module.exports` ditolak; nama publik yang hilang atau berubah diperingatkan; `LLMY_IFACE=off`); deteksi siklus panggilan (`LLMY_CYCLE=off`); batas waktu dengan peringatan 80% (`LLMY_BUDGET`);
+git wajib (folder di-`git init` bila belum; snapshot di `refs/llmy/<sesi>` tanpa menyentuh branch/index; macet ->
+file llmy kembali ke versi dengan uji lulus terbanyak);
 argumen tool yang cacat diperbaiki; sub-agent baca-saja berjalan paralel; `llmy stats` meringkas metrik lokal.
 
 Instalasi dan manual: <https://ll.my.id>

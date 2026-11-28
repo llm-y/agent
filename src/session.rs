@@ -14,6 +14,8 @@ pub struct Session {
     dir: PathBuf,
     cwd: PathBuf,
     file: Option<File>,
+    /// Nama file sesi yang sedang dipakai (tanpa `.jsonl`).
+    id: Option<String>,
 }
 
 pub struct Entry {
@@ -37,7 +39,7 @@ fn slug(cwd: &Path) -> String {
 
 impl Session {
     pub fn new(root: &Path, cwd: &Path) -> Session {
-        Session { dir: root.join(slug(cwd)), cwd: cwd.into(), file: None }
+        Session { dir: root.join(slug(cwd)), cwd: cwd.into(), file: None, id: None }
     }
 
     /// Mulai file baru pada penulisan berikutnya.
@@ -86,6 +88,7 @@ impl Session {
             f.seek(SeekFrom::End(0)).and_then(|_| f.write_all(b"\n")).map_err(|e| e.to_string())?;
         }
         self.file = Some(f);
+        self.id = Some(id);
         if repair(&mut msgs) {
             self.set(&msgs)?;
         }
@@ -97,17 +100,25 @@ impl Session {
             let io = |e: std::io::Error| e.to_string();
             sys::private_dir(&self.dir).map_err(io)?;
             let ms = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis());
-            let path = self.dir.join(format!("{ms}-{}.jsonl", std::process::id()));
+            let id = format!("{ms}-{}", std::process::id());
+            let path = self.dir.join(format!("{id}.jsonl"));
             let mut f = sys::private_file(&path).map_err(io)?;
             lock(&f)?;
             f.write_all(format!("{}\n", json!({"v":1,"cwd":self.cwd.to_string_lossy()})).as_bytes()).map_err(io)?;
             self.file = Some(f);
+            self.id = Some(id);
         }
         Ok(self.file.as_mut().unwrap())
     }
 
     fn line(&mut self, v: Value) -> Result<(), String> {
         self.open()?.write_all(format!("{v}\n").as_bytes()).map_err(|e| e.to_string())
+    }
+
+    /// Id sesi (dibuat bila belum ada), untuk ref snapshot git `refs/llmy/<id>`.
+    pub fn id(&mut self) -> Option<String> {
+        self.open().ok()?;
+        self.id.clone()
     }
 
     pub fn push(&mut self, m: &Value) -> Result<(), String> {
