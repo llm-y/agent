@@ -76,7 +76,7 @@ mod tests {
     use super::*;
 
     fn bash(c: &str) -> Prepared {
-        Prepared { action: Action::Bash { cmd: c.into(), timeout: 1 }, title: "".into(), guarded: false, memory: false }
+        Prepared { action: Action::Bash { cmd: c.into(), timeout: 1, script: None }, title: "".into(), guarded: false, memory: false }
     }
     fn write(guarded: bool) -> Prepared {
         Prepared {

@@ -56,6 +56,8 @@ pub fn schema() -> Value {
           json!({"path": s("File path, relative to the working directory"), "content": s("Full file content")}), &["path", "content"]),
         f("bash", "Run a bash command in the working directory. Use it for build, test, git; not for reading or searching files.",
           json!({"command": s("Command"), "timeout": i("Seconds, default 120, max 600")}), &["command"]),
+        f("script", "Run a short Python program (or Node with lang node) in the working directory to make the same mechanical change in many files at once, e.g. rename a function everywhere, replace a pattern, update imports. One script instead of many edit calls. llmy reports which files changed with a diff, checks them, and /undo reverts them. Print what you changed. For a change in one or two places use edit.",
+          json!({"code": s("Program source. Use relative paths; read files, change the text, write them back"), "lang": {"type":"string","enum":["python","node"],"description":"Default python"}, "timeout": i("Seconds, default 120, max 600")}), &["code"]),
         f("task", "Give a self-contained subtask to a sub-agent. It starts with a fresh context and the same tools, works alone, and returns a short report with the files it changed. Use it for an independent part of a large job (for example one module or one group of files) or a broad search whose details you do not need. Do small steps yourself. Write complete instructions: the sub-agent cannot see this conversation.",
           json!({"task": s("Complete instructions: goal, relevant files, constraints, and what to report back"), "files": {"type":"array","items":{"type":"string"},"description":"Files the sub-agent should start from"},
                  "readonly": {"type":"boolean","description":"true if the sub-agent only needs to read and search (it then gets only read tools). Several readonly tasks in one reply run in parallel"}}), &["task"]),
@@ -76,7 +78,9 @@ pub enum Action {
     Read { path: PathBuf, offset: usize, limit: usize },
     Grep { path: PathBuf, query: grep::Query },
     Write { path: PathBuf, old: Option<String>, new: String, is_edit: bool },
-    Bash { cmd: String, timeout: u64 },
+    /// `script`: kode program dari tool `script` (bahasa, kode), untuk ditampilkan saat izin dan
+    /// agar hasilnya diberi diff; `cmd` tetap perintah yang dijalankan dan disetujui.
+    Bash { cmd: String, timeout: u64, script: Option<(String, String)> },
     /// Tool internet (`web.rs`); `lines` ditampilkan saat meminta izin.
     Web { tool: String, args: Value, lines: Vec<String> },
     /// Ringkas teks tanpa jaringan.
@@ -334,7 +338,26 @@ pub fn prepare(name: &str, a: &Value, cwd: &Path) -> Result<Prepared, String> {
                 return Err("command kosong atau tidak valid".into());
             }
             let timeout = int_arg(a, "timeout").unwrap_or(120).clamp(1, 600);
-            Ok(Prepared { title: "bash".into(), guarded: false, memory: false, action: Action::Bash { cmd, timeout } })
+            Ok(Prepared { title: "bash".into(), guarded: false, memory: false, action: Action::Bash { cmd, timeout, script: None } })
+        }
+        "script" => {
+            let code = str_arg(a, "code")?;
+            if code.trim().is_empty() || code.contains('\0') {
+                return Err("code kosong atau tidak valid".into());
+            }
+            let lang = match a["lang"].as_str().unwrap_or("python").trim().to_lowercase().as_str() {
+                "" | "python" | "python3" | "py" => "python",
+                "node" | "js" | "javascript" => "node",
+                l => return Err(format!("lang `{l}` tidak didukung: pakai python atau node")),
+            };
+            let timeout = int_arg(a, "timeout").unwrap_or(120).clamp(1, 600);
+            let n = code.lines().count();
+            Ok(Prepared {
+                title: format!("script {lang} ({n} baris)"),
+                guarded: false,
+                memory: false,
+                action: Action::Bash { cmd: script_cmd(lang, &code), timeout, script: Some((lang.into(), code)) },
+            })
         }
         "task" => {
             let task = str_arg(a, "task")?;
@@ -690,7 +713,7 @@ pub fn run(p: Prepared, cwd: &Path, ctx: u64, cancel: &Cancel) -> Output {
             search(&query, &path, cwd, cap(GREP_MAX, ctx), cancel).unwrap_or_else(Output::err)
         }
         Action::Write { path, old, new, is_edit } => write(&path, old, &new, is_edit).unwrap_or_else(Output::err),
-        Action::Bash { cmd, timeout } => bash(&cmd, timeout, cwd, cap(BASH_MAX, ctx), cancel).unwrap_or_else(Output::err),
+        Action::Bash { cmd, timeout, .. } => bash(&cmd, timeout, cwd, cap(BASH_MAX, ctx), cancel).unwrap_or_else(Output::err),
         Action::Web { tool, args, .. } => web::run(&tool, &args, cap(WEB_MAX, ctx), cancel),
         Action::Essence { text } => web::essence(&text),
         Action::Task { .. } => Output::err("task dijalankan oleh agent"),
@@ -850,6 +873,19 @@ impl Capped {
         format!("{}\n... [{} byte dipotong] ...\n{}", String::from_utf8_lossy(&self.head),
             self.dropped, String::from_utf8_lossy(&self.tail))
     }
+}
+
+/// Perintah shell untuk tool `script`: kode lewat heredoc berkutip (tanpa ekspansi shell), jadi tidak ada
+/// file sementara dan pengguna menyetujui teks yang persis dijalankan. Di Windows `python3` bisa berupa
+/// pintasan Microsoft Store yang tidak menjalankan apa pun, jadi dicoba dulu.
+fn script_cmd(lang: &str, code: &str) -> String {
+    let end = format!("LLMY_SCRIPT_{:x}", sys::fnv(code.as_bytes()));
+    let run = match lang {
+        "node" => "node -".to_string(),
+        _ => "if python3 -c '' 2>/dev/null; then P=python3; else P=python; fi; \"$P\" -".to_string(),
+    };
+    let code = code.strip_suffix('\n').unwrap_or(code);
+    format!("{run} <<'{end}'\n{code}\n{end}")
 }
 
 fn bash(cmd: &str, timeout: u64, cwd: &Path, max: usize, cancel: &Cancel) -> Result<Output, String> {
@@ -1192,6 +1228,30 @@ mod tests {
         assert!(secret(".ENV.local") && secret("ID_RSA") && !secret("environment.rs") && !secret("monkey.rs"));
         let o = run(prepare("grep", &json!({"pattern":"x"}), &d).unwrap(), &d, 32768, &Cancel::default());
         assert_eq!(o.text, "a.txt:1: x\n");
+    }
+
+    #[test]
+    fn script_python_dan_node_tanpa_ekspansi_shell() {
+        let d = dir("script");
+        fs::write(d.join("a.py"), "def lama(): pass\nlama()\n").unwrap();
+        fs::write(d.join("b.py"), "from a import lama\n").unwrap();
+        let c = Cancel::default();
+        // `$HOME`, backtick, kutip, dan baris yang mirip penutup heredoc tidak boleh disentuh shell.
+        let code = "import pathlib\nfor f in sorted(pathlib.Path('.').glob('*.py')):\n    t = f.read_text()\n    f.write_text(t.replace('lama', 'baru'))\n    print(f, \"$HOME `x` 'q'\")\nEOF\n";
+        let code = code.replace("EOF\n", "# EOF\n");
+        let p = prepare("script", &json!({"code": code}), &d).unwrap();
+        assert_eq!(p.title, "script python (6 baris)");
+        let o = run(p, &d, 32_768, &c);
+        assert!(o.ok && o.text.contains("a.py $HOME `x` 'q'") && o.text.contains("b.py"), "{}", o.text);
+        assert_eq!(fs::read_to_string(d.join("a.py")).unwrap(), "def baru(): pass\nbaru()\n");
+        let o = run(prepare("script", &json!({"code": "raise SystemExit('gagal di sini')"}), &d).unwrap(), &d, 32_768, &c);
+        assert!(!o.ok && o.text.contains("gagal di sini"), "{}", o.text);
+        if std::process::Command::new("node").arg("-v").output().is_ok() {
+            let o = run(prepare("script", &json!({"lang": "js", "code": "const fs = require('fs'); console.log(fs.readFileSync('b.py', 'utf8').trim())"}), &d).unwrap(), &d, 32_768, &c);
+            assert!(o.ok && o.text.contains("from a import baru"), "{}", o.text);
+        }
+        assert!(prepare("script", &json!({"code": "x", "lang": "ruby"}), &d).is_err());
+        assert!(prepare("script", &json!({"code": "  "}), &d).is_err());
     }
 
     #[test]

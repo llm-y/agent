@@ -1259,6 +1259,8 @@ impl Agent {
         }
         // Perintah yang bisa mengubah file: pindai folder sebelum dan sesudahnya.
         let watch = matches!(&p.action, Action::Bash { cmd, .. } if !reads_only(cmd));
+        let script = matches!(&p.action, Action::Bash { script: Some(_), .. });
+        self.stat.scripts += u32::from(script);
         if watch {
             self.tree = Some(track::scan(&self.cwd, self.tree.as_ref().unwrap_or(&track::Tree::default())));
         }
@@ -1277,7 +1279,7 @@ impl Agent {
             let after = track::scan(&self.cwd, &before);
             let changes = track::diff(&before, &after);
             self.tree = Some(after);
-            self.bash_changes(changes, &mut o);
+            self.bash_changes(changes, &mut o, script);
         }
         if test_cmd && !self.sub && let (Some(s), Some(r)) = (crate::git::score(&o.text), &mut self.repo) {
             r.scored(s);
@@ -1300,14 +1302,33 @@ impl Agent {
     }
 
     /// File yang diubah `bash`: dicatat seperti edit (undo, rollback, verifikasi), dan model diberi tahu.
-    fn bash_changes(&mut self, changes: Vec<track::Change>, o: &mut Output) {
+    /// `script`: model juga diberi diff ringkas, jadi tidak perlu membaca ulang setiap file. Export ESM yang
+    /// diganti CommonJS dikembalikan, sama seperti penolakan pada `write`/`edit`.
+    fn bash_changes(&mut self, changes: Vec<track::Change>, o: &mut Output, script: bool) {
         if changes.is_empty() {
+            if script {
+                o.text += "\n[llmy: this script changed no files]";
+            }
             return;
         }
         let mut names = vec![];
         let mut lost = vec![];
+        let mut diffs = String::new();
+        let mut rejected = vec![];
         for c in changes {
             let rel = c.path.strip_prefix(&self.cwd).unwrap_or(&c.path).display().to_string().replace('\\', "/");
+            if self.iface
+                && let (Some(b), Some(a)) = (&c.before, &c.after)
+                && crate::iface::to_cjs(&c.path, b, a)
+                && std::fs::write(&c.path, b).is_ok()
+            {
+                self.stat.iface_block += 1;
+                rejected.push(format!("{rel}: {}", crate::iface::cjs_error(&c.path, b)));
+                continue;
+            }
+            if script && diffs.len() < SCRIPT_DIFF {
+                diffs += &if c.known { script_diff(&rel, c.before.as_deref(), c.after.as_deref()) } else { format!("--- {rel} (too large to diff)\n") };
+            }
             if c.known {
                 self.record(&c.path, c.before);
             } else {
@@ -1326,8 +1347,23 @@ impl Agent {
             names.truncate(20);
             names.push(format!("... {} more", n - 20));
         }
-        o.text += &format!("\n[llmy: files changed by this command: {}]", names.join(", "));
-        o.summary += &format!(" · {n} file berubah");
+        if n > 0 {
+            o.text += &format!("\n[llmy: files changed by this command: {}]", names.join(", "));
+            o.summary += &format!(" · {n} file berubah");
+        }
+        if !diffs.is_empty() {
+            if diffs.len() > SCRIPT_DIFF {
+                let cut = (0..=SCRIPT_DIFF).rev().find(|i| diffs.is_char_boundary(*i)).unwrap_or(0);
+                diffs.truncate(cut);
+                diffs += "\n... (diff cut; read a file to see the rest)";
+            }
+            o.text += &format!("\n[llmy: diff of the script's changes]\n{diffs}");
+        }
+        if !rejected.is_empty() {
+            o.ok = false;
+            o.summary += &format!(" · {} dikembalikan (CommonJS)", rejected.len());
+            o.text += &format!("\n[llmy reverted these files]\n{}", rejected.join("\n"));
+        }
         if !lost.is_empty() {
             self.send(Ev::Info(format!("Isi lama {} tidak tersimpan (terlalu besar); /undo tidak bisa mengembalikannya.", lost.join(", "))));
         }
@@ -1423,7 +1459,7 @@ impl Agent {
         let (mut failed, mut gone) = (vec![], vec![]);
         let mut score: Option<(usize, usize)> = None;
         for (i, cmd) in &run {
-            let p = Prepared { action: Action::Bash { cmd: cmd.clone(), timeout: 600 }, title: "uji".into(), guarded: false, memory: false };
+            let p = Prepared { action: Action::Bash { cmd: cmd.clone(), timeout: 600, script: None }, title: "uji".into(), guarded: false, memory: false };
             let o = tools::run(p, &self.gates[*i].dir, self.provider.ctx, &self.cancel);
             if let Some((a, b)) = crate::git::score(&o.text) {
                 let s = score.unwrap_or((0, 0));
@@ -1506,7 +1542,7 @@ impl Agent {
         }
         let (mut failed, mut ran, mut gone, mut weight) = (vec![], vec![], vec![], 0);
         for (i, cmd) in &run {
-            let p = Prepared { action: Action::Bash { cmd: cmd.clone(), timeout: 300 }, title: "verifikasi".into(), guarded: false, memory: false };
+            let p = Prepared { action: Action::Bash { cmd: cmd.clone(), timeout: 300, script: None }, title: "verifikasi".into(), guarded: false, memory: false };
             let o = tools::run(p, &self.checks[*i].dir, self.provider.ctx, &self.cancel);
             if self.cancel.is_set() {
                 self.vmem.skip();
@@ -1569,6 +1605,7 @@ impl Agent {
         }
         let (reply, rx) = channel();
         let mut question = format!("Izinkan {}?", match &p.action {
+            Action::Bash { script: Some(_), .. } => "script ini".to_string(),
             Action::Bash { .. } => "perintah ini".to_string(),
             _ => p.title.clone(),
         });
@@ -1725,6 +1762,58 @@ fn tail(msgs: &[Value]) -> Vec<Value> {
 }
 
 const HINTED: &str = "#dialihkan";
+
+/// Batas byte diff hasil `script` untuk model.
+const SCRIPT_DIFF: usize = 6_000;
+
+/// Baris yang berubah (LCS per baris): `-` nomor baris lama, `+` nomor baris baru. File besar memakai
+/// `tools::diff` (satu blok dari awalan sampai akhiran yang sama).
+fn line_diff(old: &str, new: &str) -> Vec<(char, usize, String)> {
+    let (a, b): (Vec<&str>, Vec<&str>) = (old.lines().collect(), new.lines().collect());
+    if a.len() * b.len() > 4_000_000 {
+        return tools::diff(old, new).into_iter().filter(|(k, _, _)| *k != ' ').collect();
+    }
+    // l[i][j]: panjang LCS a[i..] dan b[j..].
+    let w = b.len() + 1;
+    let mut l = vec![0u32; (a.len() + 1) * w];
+    for i in (0..a.len()).rev() {
+        for j in (0..b.len()).rev() {
+            l[i * w + j] = if a[i] == b[j] { l[(i + 1) * w + j + 1] + 1 } else { l[(i + 1) * w + j].max(l[i * w + j + 1]) };
+        }
+    }
+    let (mut i, mut j, mut v) = (0, 0, vec![]);
+    while i < a.len() || j < b.len() {
+        if i < a.len() && j < b.len() && a[i] == b[j] {
+            (i, j) = (i + 1, j + 1);
+        } else if i < a.len() && (j == b.len() || l[(i + 1) * w + j] >= l[i * w + j + 1]) {
+            v.push(('-', i + 1, a[i].to_string()));
+            i += 1;
+        } else {
+            v.push(('+', j + 1, b[j].to_string()));
+            j += 1;
+        }
+    }
+    v
+}
+
+/// Diff satu file untuk model: baris berubah saja, maks. 40 baris per file.
+fn script_diff(rel: &str, before: Option<&str>, after: Option<&str>) -> String {
+    let (b, a) = (before.unwrap_or(""), after.unwrap_or(""));
+    let tag = match (before, after) {
+        (None, Some(_)) => " (new)",
+        (_, None) => " (deleted)",
+        _ => "",
+    };
+    let d = line_diff(b, a);
+    let mut s = format!("--- {rel}{tag}\n");
+    for (k, n, l) in d.iter().take(40) {
+        s += &format!("{k}{n}: {l}\n");
+    }
+    if d.len() > 40 {
+        s += &format!("... {} more changed lines\n", d.len() - 40);
+    }
+    s
+}
 const HINT: &str = "bash needs the user's permission; nothing was run. Use a tool that does not: read with path \".\" lists a directory, read opens a file, grep with only glob (e.g. *.rs) finds files by name, grep with pattern searches contents. Call bash again only if these cannot do it.";
 
 const HINT_PATH: &str = "that path is outside the working directory or may hold secrets and needs the user's permission; nothing was read. Omit path to search the working directory. Use an outside path only if the user asked for it.";
@@ -1815,6 +1904,8 @@ fn detail(p: &Prepared) -> Detail {
         Action::Task { task, .. } => task.lines().map(|l| (' ', 0, l.to_string())).collect(),
         Action::Web { lines, .. } => lines.iter().map(|l| (' ', 0, l.clone())).collect(),
         // Perintah selalu tampil utuh: pengguna menyetujui apa yang ia lihat.
+        Action::Bash { script: Some((lang, code)), .. } =>
+            std::iter::once(('$', 0, format!("{lang} -"))).chain(code.lines().map(|l| (' ', 0, l.to_string()))).collect(),
         Action::Bash { cmd, .. } => cmd.lines().map(|l| ('$', 0, l.to_string())).collect(),
         Action::Write { old, new, .. } => {
             let mut d = tools::diff(old.as_deref().unwrap_or(""), new);
@@ -1831,6 +1922,15 @@ fn detail(p: &Prepared) -> Detail {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diff_baris_hanya_yang_berubah() {
+        let d = line_diff("a\nb\nc\nd\ne\n", "A\nb\nc\nd\ne\nf\n");
+        assert_eq!(d, vec![('-', 1, "a".into()), ('+', 1, "A".into()), ('+', 6, "f".into())]);
+        assert_eq!(line_diff("x\n", "x\n"), vec![]);
+        let s = script_diff("p.py", None, Some("y\n"));
+        assert_eq!(s, "--- p.py (new)\n+1: y\n");
+    }
 
     #[test]
     fn siklus_dua_sampai_empat_panggilan() {

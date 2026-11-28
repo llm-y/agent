@@ -8,7 +8,8 @@ hanya terbaca pemilik) atau `/api` di dalam sesi. Memori cukup di `AGENTS.md`: b
 milik proyek, atau `~/.config/llmy/AGENTS.md` yang terbawa ke semua proyek. Tanpa database.
 
 Tool: `read` (juga per simbol), `head`, `tail`, `grep`, `edit` (juga beberapa bagian sekaligus), `write`,
-`bash`, `task` (sub-agent dengan context baru), `essence`, `remember`, dan tool internet
+`bash`, `script` (program Python atau Node untuk perubahan yang sama di banyak file sekaligus; model menerima
+diff ringkasnya), `task` (sub-agent dengan context baru), `essence`, `remember`, dan tool internet
 `curl`, `github`, `openalex`, `doi`, `spider`; `tavily`, `exa`, `linkup`, `firecrawl`, `scopus`, dan
 `brightdata` muncul bila kuncinya ada di env. Setiap tindakan ditanya, kecuali dengan `--allow` atau
 mode auto (`--auto`, `/auto`, Shift+Tab).
