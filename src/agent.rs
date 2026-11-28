@@ -22,6 +22,18 @@ const MAX_REPEAT: usize = 3;
 /// Tanpa batas langkah, model yang macet dihentikan setelah sekian tool gagal berturut-turut.
 const MAX_FAILS: usize = 8;
 
+/// Periode (2–4) bila ekor jejak berupa urutan yang sama diulang 3 kali, dan bukan satu panggilan saja
+/// (panggilan identik berturut-turut sudah ditolak `MAX_REPEAT`).
+fn cycle(trail: &[u64]) -> Option<usize> {
+    (2..=4).find(|&p| {
+        let n = trail.len();
+        n >= 3 * p && {
+            let t = &trail[n - 3 * p..];
+            (p..3 * p).all(|i| t[i] == t[i - p]) && t[..p].iter().any(|x| *x != t[0])
+        }
+    })
+}
+
 /// Baris tampilan: penanda (' ', '-', '+', '$'), nomor baris (0 = tanpa), teks.
 pub type Detail = Vec<(char, usize, String)>;
 
@@ -112,6 +124,16 @@ pub struct Agent {
     /// Peta proyek di pesan pertama dan catatan state (`LLMY_MAP=on`). Bawaan mati: ablasi E09 tidak
     /// menunjukkan manfaat (gerbang 45/48 vs + konteks 43/48, McNemar p = 0,69), padahal menambah token.
     pub map: bool,
+    /// Penjaga antarmuka (`iface.rs`; `LLMY_IFACE=off` mematikan, untuk ablasi).
+    pub iface: bool,
+    /// File yang sudah dibaca (atau ditulis) di proses ini: `write` utuh atas file lain yang sudah ada ditolak.
+    seen: std::collections::HashSet<PathBuf>,
+    /// Deteksi siklus 2–4 panggilan dengan hasil sama (`LLMY_CYCLE=off` mematikan).
+    pub cycle: bool,
+    /// Batas waktu proses (`LLMY_BUDGET`, detik): pada 80% model diminta menyelesaikan. Mulai dihitung saat
+    /// Agent dibuat; untuk `-p` di benchmark, sama dengan batas waktu pemanggil.
+    pub budget: Option<(std::time::Instant, std::time::Duration)>,
+    wrapped: bool,
 }
 
 enum GateEnd {
@@ -218,6 +240,11 @@ impl Agent {
                 Some("blind") => GateMode::Blind,
                 _ => GateMode::On,
             }, map: crate::provider::env("LLMY_MAP").is_some_and(|v| v == "on"),
+            iface: crate::provider::env("LLMY_IFACE").is_none_or(|v| v != "off"),
+            cycle: crate::provider::env("LLMY_CYCLE").is_none_or(|v| v != "off"),
+            budget: crate::provider::env("LLMY_BUDGET").and_then(|v| v.parse::<u64>().ok()).filter(|s| *s > 0)
+                .map(|s| (std::time::Instant::now(), std::time::Duration::from_secs(s))),
+            wrapped: false, seen: Default::default(),
         };
         // JSON skema + pembungkus per provider (perkiraan).
         a.schema_bytes = a.tools.to_string().len() * 11 / 10;
@@ -605,6 +632,9 @@ impl Agent {
         let wish = if self.sub { None } else { memory::wish(user_part(&text)) };
         self.push(json!({"role":"user","content":text}));
         let mut history: Vec<String> = vec![];
+        // Jejak (tool, argumen, hasil) untuk deteksi siklus; dan berapa kali siklus sudah diperingatkan.
+        let mut trail: Vec<u64> = vec![];
+        let mut cycles = 0;
         let mut fails = 0;
         // Uji yang gagal dikembalikan ke model paling banyak dua kali per giliran.
         let mut gate_left = 2;
@@ -782,9 +812,27 @@ impl Agent {
                     o
                 };
                 fails = if out.ok { 0 } else { fails + 1 };
+                trail.push(crate::sys::fnv(format!("{}{}{}", c["function"]["name"], c["function"]["arguments"], out.text).as_bytes()));
                 self.stat.steps += 1;
                 self.stat.tool_fail += u32::from(!out.ok);
                 outs.push(out);
+            }
+            // Siklus A,B,A,B dengan hasil yang sama lolos dari penolakan panggilan identik berturut-turut.
+            let mut looped = false;
+            if self.cycle && !stop && let Some(p) = cycle(&trail) {
+                cycles += 1;
+                trail.clear();
+                self.stat.cycles += 1;
+                looped = cycles >= 2;
+                if let Some(o) = outs.last_mut() {
+                    o.text += &format!("\n\n[llmy: the last {} calls repeat the same {p}-call sequence with identical results. This is a loop. Stop repeating it: change approach, or explain what is blocking you.]", 3 * p);
+                }
+            }
+            if !self.sub && !self.wrapped && let Some((t0, b)) = self.budget && t0.elapsed() >= b.mul_f32(0.8) {
+                self.wrapped = true;
+                if let Some(o) = outs.last_mut() {
+                    o.text += "\n\n[llmy: 80% of the time budget is used. Stop exploring now. Finish the required change, run the tests once if you can, and give the final answer.]";
+                }
             }
             // Hasil verifikasi menempel pada hasil edit terakhir: pasangan tool_calls tetap utuh.
             if let Some(i) = last_write
@@ -804,6 +852,9 @@ impl Agent {
                 let n = self.vmem.streak;
                 self.vmem.streak = 0;
                 return self.stuck(format!("Berhenti: verifikasi gagal {n} kali berturut-turut tanpa kemajuan. Ketik \"lanjutkan\" atau beri arahan lain."));
+            }
+            if looped && !stop {
+                return self.stuck("Berhenti: model mengulang urutan panggilan yang sama setelah diperingatkan. Ketik \"lanjutkan\" atau beri arahan lain.".into());
             }
             if fails >= MAX_FAILS && !stop {
                 return self.stuck(format!("Berhenti: {fails} tool gagal berturut-turut. Ketik \"lanjutkan\" atau beri arahan lain."));
@@ -1111,6 +1162,12 @@ impl Agent {
             self.send(Ev::ToolDone { ok: false, summary: "isi ini sudah gagal diverifikasi".into() });
             return (Output::err(e), Step::Continue);
         }
+        if let Some(e) = self.iface_block(&p) {
+            self.send(Ev::Tool { title: p.title.clone(), detail: vec![] });
+            self.send(Ev::ToolDone { ok: false, summary: "ditolak penjaga antarmuka".into() });
+            self.stat.iface_block += 1;
+            return (Output::err(e), Step::Continue);
+        }
         self.send(Ev::Tool { title: p.title.clone(), detail: detail(&p) });
         // Arahkan ke cara tanpa izin dulu, alih-alih langsung mengganggu pengguna.
         if !self.perm.auto(&p)
@@ -1170,7 +1227,16 @@ impl Agent {
         if watch {
             self.tree = Some(track::scan(&self.cwd, self.tree.as_ref().unwrap_or(&track::Tree::default())));
         }
+        let read = match &p.action {
+            Action::Read { path, .. } => vec![path.clone()],
+            // `cat`/`head`/`sed -n` di bash juga membaca: file yang namanya disebut dianggap terbaca.
+            Action::Bash { cmd, .. } if reads_only(cmd) => self.turn_files(cmd),
+            _ => vec![],
+        };
         let mut o = tools::run(p, &self.cwd, self.provider.ctx, &self.cancel);
+        if o.ok {
+            self.seen.extend(read);
+        }
         if watch && let Some(before) = self.tree.take() {
             let after = track::scan(&self.cwd, &before);
             let changes = track::diff(&before, &after);
@@ -1181,6 +1247,10 @@ impl Agent {
             && let Some((path, new)) = written
         {
             self.vmem.wrote(&path, &new);
+            self.seen.insert(path.clone());
+            if let Some(n) = self.iface_note(&path, &new) {
+                o.text += &n;
+            }
         }
         if o.ok && !saved.is_empty() {
             // Dengan isi lengkap, model bisa mengganti fakta yang bertentangan.
@@ -1206,6 +1276,9 @@ impl Agent {
             }
             if let Some(a) = &c.after {
                 self.vmem.wrote(&c.path, a);
+                if let Some(n) = self.iface_note(&c.path, a) {
+                    o.text += &n;
+                }
             }
             names.push(format!("{rel}{}", if c.after.is_none() { " (deleted)" } else { "" }));
         }
@@ -1219,6 +1292,45 @@ impl Agent {
         if !lost.is_empty() {
             self.send(Ev::Info(format!("Isi lama {} tidak tersimpan (terlalu besar); /undo tidak bisa mengembalikannya.", lost.join(", "))));
         }
+    }
+
+    /// Penolakan penjaga antarmuka sebelum menulis: `write` utuh atas file yang ada tetapi belum dibaca, atau
+    /// export ESM diganti CommonJS. Pembanding: isi file di awal giliran, atau isi sekarang.
+    fn iface_block(&self, p: &Prepared) -> Option<String> {
+        let Action::Write { path, old: Some(old), new, is_edit } = &p.action else { return None };
+        if !self.iface || p.memory {
+            return None;
+        }
+        let rel = path.strip_prefix(&self.cwd).unwrap_or(path).display().to_string().replace('\\', "/");
+        if !is_edit && !old.trim().is_empty() && !self.seen.contains(path) {
+            return Some(format!(
+                "rejected: {rel} already exists and you have not read it yet. Its current content may define names and an \
+                 interface that tests and other files use. Read it first, then change it with edit (or write the whole file \
+                 if you still must)."
+            ));
+        }
+        let base = self.turn_log.get(path).cloned().flatten().unwrap_or_else(|| old.clone());
+        crate::iface::to_cjs(path, &base, new).then(|| crate::iface::cjs_error(path, &base))
+    }
+
+    /// File di folder kerja yang namanya muncul di perintah baca `bash` (mis. `cat a.js`).
+    fn turn_files(&self, cmd: &str) -> Vec<PathBuf> {
+        cmd.split(|c: char| c.is_whitespace() || matches!(c, '\'' | '"' | ';' | '|' | '&' | '<' | '>'))
+            .filter(|w| !w.is_empty() && !w.starts_with('-'))
+            .map(|w| self.cwd.join(w.trim_start_matches("./")))
+            .filter(|p| p.is_file())
+            .collect()
+    }
+
+    /// Peringatan bila tulisan ini merusak antarmuka publik file dibanding awal giliran.
+    fn iface_note(&mut self, path: &std::path::Path, new: &str) -> Option<String> {
+        if !self.iface {
+            return None;
+        }
+        let old = self.turn_log.get(path)?.as_deref()?;
+        let n = crate::iface::check(path, old, new)?;
+        self.stat.iface_warn += 1;
+        Some(n)
     }
 
     /// Uji proyek untuk file yang berubah di giliran ini, bila belum lulus untuk isi yang sama.
@@ -1667,6 +1779,17 @@ fn detail(p: &Prepared) -> Detail {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn siklus_dua_sampai_empat_panggilan() {
+        assert_eq!(cycle(&[1, 2, 1, 2, 1, 2]), Some(2));
+        assert_eq!(cycle(&[9, 1, 2, 3, 1, 2, 3, 1, 2, 3]), Some(3));
+        // Baru dua putaran, atau hasilnya berubah (edit lalu uji dengan keluaran baru): bukan siklus.
+        assert_eq!(cycle(&[1, 2, 1, 2]), None);
+        assert_eq!(cycle(&[1, 2, 1, 2, 1, 3]), None);
+        // Satu panggilan identik berulang ditangani MAX_REPEAT, bukan di sini.
+        assert_eq!(cycle(&[5, 5, 5, 5, 5, 5]), None);
+    }
 
     #[test]
     fn saran_hanya_untuk_perintah_baca() {

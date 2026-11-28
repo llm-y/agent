@@ -8,6 +8,7 @@ mod editor;
 mod gemini;
 mod grep;
 mod http;
+mod iface;
 mod memory;
 mod metrics;
 mod ollama;

@@ -19,6 +19,10 @@ pub struct Turn {
     pub subagents: u32,
     pub repaired_args: u32,
     pub loose_edits: u32,
+    /// Peringatan penjaga antarmuka dan siklus panggilan (E13).
+    pub iface_warn: u32,
+    pub iface_block: u32,
+    pub cycles: u32,
     /// Jumlah panggilan model dan total token yang diproses (masukan + keluaran, semua panggilan).
     pub calls: u32,
     pub tokens_total: u64,
@@ -48,7 +52,7 @@ pub fn write(t: &Turn, model: &str, flow: &str, end: &str, tokens: u64) {
         "v": crate::VERSION, "model": model, "flow": flow, "end": end, "secs": (secs * 10.0).round() / 10.0, "tokens": tokens,
         "steps": t.steps, "tool_fail": t.tool_fail, "check_pass": t.check_pass, "check_fail": t.check_fail,
         "gate_pass": t.gate_pass, "gate_fail": t.gate_fail, "subagents": t.subagents,
-        "repaired_args": t.repaired_args, "loose_edits": t.loose_edits, "calls": t.calls, "tokens_total": t.tokens_total,
+        "repaired_args": t.repaired_args, "loose_edits": t.loose_edits, "iface_warn": t.iface_warn, "iface_block": t.iface_block, "cycles": t.cycles, "calls": t.calls, "tokens_total": t.tokens_total,
     });
     let open = std::fs::OpenOptions::new().create(true).append(true).open(&f);
     if let Ok(mut h) = open {

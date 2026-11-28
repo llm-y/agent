@@ -28,7 +28,8 @@ dikembalikan bila buntu. `/undo` mengembalikan file yang diubah giliran terakhir
 
 Harness: saat model menyatakan selesai, llmy menjalankan uji proyek dan mengembalikan kegagalannya ke model;
 galat pemeriksaan disertai potongan kode di lokasinya (16 tugas, qwen3.5:9b: 33/48 → 45/48 benar); peta proyek
-opsional (`LLMY_MAP=on`); `edit` toleran indentasi;
+opsional (`LLMY_MAP=on`); `edit` toleran indentasi; penjaga antarmuka (tulis ulang file yang belum dibaca dan
+`export` -> `module.exports` ditolak; nama publik yang hilang atau berubah diperingatkan; `LLMY_IFACE=off`); deteksi siklus panggilan (`LLMY_CYCLE=off`); batas waktu dengan peringatan 80% (`LLMY_BUDGET`);
 argumen tool yang cacat diperbaiki; sub-agent baca-saja berjalan paralel; `llmy stats` meringkas metrik lokal.
 
 Instalasi dan manual: <https://ll.my.id>
